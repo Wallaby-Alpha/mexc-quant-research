@@ -44,8 +44,9 @@ def load_config() -> Dict[str, Any]:
     config = {
         "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
-        "top_k": int(os.environ.get("TOP_K", "10")),
-        "rank_exit_buffer": int(os.environ.get("RANK_EXIT_BUFFER", "15")),
+        "top_k": int(os.environ.get("TOP_K", "7")),
+        "rank_exit_buffer": int(os.environ.get("RANK_EXIT_BUFFER", "11")),
+        "ranking_metric": os.environ.get("RANKING_METRIC", "sharpe_momentum"),  # "sharpe_momentum" or "raw_momentum"
         "lookback_days": int(os.environ.get("LOOKBACK_DAYS", "30")),
         "min_volume_24h_usdt": float(os.environ.get("MIN_VOLUME_USDT", "500000.0")),
     }
@@ -250,45 +251,64 @@ def run_scanner():
         alt_ret = (p1 - p0) / p0
         rs_spread = alt_ret - btc_30d_return
 
+        # Trailing 30-day daily volatility (annualized)
+        daily_rets = df_k["close"].pct_change().dropna()
+        vol_30d = float(daily_rets.std() * np.sqrt(365.25)) if len(daily_rets) >= 20 else 1.0
+        if np.isnan(vol_30d) or vol_30d <= 0.05:
+            vol_30d = 0.05
+
+        sharpe_score = alt_ret / vol_30d
+
         rankings.append({
             "symbol": sym,
             "alt_return_30d": alt_ret,
             "rs_spread_vs_btc": rs_spread,
+            "volatility_30d": vol_30d,
+            "sharpe_score": sharpe_score,
             "latest_close": p1
         })
         time.sleep(0.04) # API rate limit etiquette
 
-    df_ranks = pd.DataFrame(rankings).sort_values(by="rs_spread_vs_btc", ascending=False).reset_index(drop=True)
+    is_sharpe_mode = cfg.get("ranking_metric", "sharpe_momentum") == "sharpe_momentum"
+    sort_key = "sharpe_score" if is_sharpe_mode else "rs_spread_vs_btc"
+
+    df_ranks = pd.DataFrame(rankings).sort_values(by=sort_key, ascending=False).reset_index(drop=True)
     df_ranks["rank"] = df_ranks.index + 1
 
-    top_10 = df_ranks.head(cfg["top_k"])
-    top_10_symbols = top_10["symbol"].tolist()
-    top_15_symbols = df_ranks.head(cfg["rank_exit_buffer"])["symbol"].tolist()
+    top_k = cfg["top_k"]
+    rank_exit_buffer = cfg["rank_exit_buffer"]
+    alloc_pct = 100.0 / top_k
 
-    # 3. Determine Portfolio Actions (Applying Rank 15 Buffer Rule)
+    top_leaders = df_ranks.head(top_k)
+    top_leader_symbols = top_leaders["symbol"].tolist()
+    buffer_symbols = df_ranks.head(rank_exit_buffer)["symbol"].tolist()
+
+    # 3. Determine Portfolio Actions (Applying Rank Exit Buffer Rule)
     sells = []
     holds = []
     buys = []
 
     # Check existing holdings
     for sym in current_holdings:
-        if sym not in top_15_symbols:
+        if sym not in buffer_symbols:
             sells.append(sym)
         else:
             holds.append(sym)
 
-    # Determine which new leaders need to be added to reach Top 10 capacity
-    slots_needed = cfg["top_k"] - len(holds)
-    for sym in top_10_symbols:
+    # Determine which new leaders need to be added to reach Top K capacity
+    slots_needed = top_k - len(holds)
+    for sym in top_leader_symbols:
         if sym not in holds and len(buys) < slots_needed:
             buys.append(sym)
 
     new_holdings = holds + buys
 
     # 4. Format Actionable Telegram Notification
+    metric_label = "Quality / Sharpe Momentum (Return / Vol)" if is_sharpe_mode else "Raw 30d Momentum"
     msg = (
         f"🚀 <b>WEEKLY ROTATION SCANNER: PORTFOLIO ORDERS</b>\n"
         f"📅 <i>{now_utc}</i>\n\n"
+        f"<b>Strategy:</b> Top {top_k} ({metric_label})\n"
         f"<b>BTC Macro Trend:</b> ✅ BULLISH\n"
         f"• BTC Price: <code>${btc_close:,.2f}</code>\n"
         f"• 50-Day EMA: <code>${btc_ema50:,.2f}</code>\n"
@@ -299,32 +319,38 @@ def run_scanner():
     )
 
     if sells:
-        msg += "🔴 <b>SELL ORDERS (Dropped out of Top 15):</b>\n"
+        msg += f"🔴 <b>SELL ORDERS (Fell Below Rank #{rank_exit_buffer}):</b>\n"
         for sym in sells:
             msg += f"• SELL <code>{sym}</code> to 100% USDT\n"
         msg += "\n"
 
     if buys:
-        msg += f"🟢 <b>BUY ORDERS (Target 10% allocation each):</b>\n"
+        msg += f"🟢 <b>BUY ORDERS (Target {alloc_pct:.1f}% allocation each):</b>\n"
         for sym in buys:
             row = df_ranks[df_ranks["symbol"] == sym].iloc[0]
-            msg += f"• BUY <code>{sym}</code> (Rank #{row['rank']} | RS: {row['rs_spread_vs_btc']*100:+.1f}%)\n"
+            if is_sharpe_mode:
+                msg += f"• BUY <code>{sym}</code> (Rank #{row['rank']} | Ret: {row['alt_return_30d']*100:+.1f}% | SharpeScore: {row['sharpe_score']:.2f})\n"
+            else:
+                msg += f"• BUY <code>{sym}</code> (Rank #{row['rank']} | RS: {row['rs_spread_vs_btc']*100:+.1f}%)\n"
         msg += "\n"
 
     if holds:
-        msg += "🟡 <b>HOLD (Maintained in Top 15):</b>\n"
+        msg += f"🟡 <b>HOLD (Maintained Inside Buffer #{rank_exit_buffer}):</b>\n"
         for sym in holds:
             row = df_ranks[df_ranks["symbol"] == sym].iloc[0]
             msg += f"• HOLD <code>{sym}</code> (Rank #{row['rank']})\n"
         msg += "\n"
 
     if not sells and not buys:
-        msg += "✨ <b>NO CHANGES REQUIRED!</b> Current holdings remain firmly inside the Top 10/15.\n\n"
+        msg += f"✨ <b>NO CHANGES REQUIRED!</b> Current holdings remain firmly inside Top {top_k}/Buffer #{rank_exit_buffer}.\n\n"
 
     msg += "━━━━━━━━━━━━━━━━━━━\n"
-    msg += "🏆 <b>TOP 10 RELATIVE STRENGTH LEADERS:</b>\n"
-    for _, row in top_10.iterrows():
-        msg += f"<b>#{row['rank']:2d}</b> <code>{row['symbol']:10s}</code>: {row['alt_return_30d']*100:+5.1f}% (RS: {row['rs_spread_vs_btc']*100:+5.1f}%)\n"
+    msg += f"🏆 <b>TOP {top_k} PORTFOLIO SELECTIONS:</b>\n"
+    for _, row in top_leaders.iterrows():
+        if is_sharpe_mode:
+            msg += f"<b>#{row['rank']:2d}</b> <code>{row['symbol']:10s}</code>: {row['alt_return_30d']*100:+5.1f}% (Score: {row['sharpe_score']:4.2f} | Vol: {row['volatility_30d']*100:3.0f}%)\n"
+        else:
+            msg += f"<b>#{row['rank']:2d}</b> <code>{row['symbol']:10s}</code>: {row['alt_return_30d']*100:+5.1f}% (RS: {row['rs_spread_vs_btc']*100:+5.1f}%)\n"
 
     print(msg)
     save_portfolio_state(new_holdings)
