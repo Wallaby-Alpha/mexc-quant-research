@@ -1,0 +1,10 @@
+{
+  "total_trials_evaluated": 14,
+  "best_trial_id": "TRIAL_003_Entry_C_RR1.0_H24.0_B0.25",
+  "best_net_expectancy_r": -0.4383309563421862,
+  "best_sharpe": -5.856093083556662,
+  "sharpe_variance_across_trials": 879.9235104777993,
+  "deflated_sharpe_ratio": 0.0,
+  "statistically_significant_after_trials": false,
+  "multiple_testing_warning": "Total 14 parameter configurations were tested. Due to selection bias, any unadjusted peak is suspect."
+}

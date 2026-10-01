@@ -1,0 +1,46 @@
+{
+  "timestamp_utc": "2026-10-01T01:21:00.231274+00:00",
+  "holdout_start": "2026-07-01T00:00:00Z",
+  "frozen_parameters": {
+    "entry_mode": "Entry_B",
+    "min_rr": 1.0,
+    "stop_buffer_atr": 0.5,
+    "max_hold_hours": 24,
+    "fractal_n": 3,
+    "pullback_depth_atr": 0.5
+  },
+  "total_holdout_trades": 162,
+  "metrics": {
+    "n_trades": 162,
+    "insufficient_sample": false,
+    "win_rate_net": 0.35185185185185186,
+    "win_rate_net_ci_low": 0.2825220209361388,
+    "win_rate_net_ci_high": 0.4280448972397342,
+    "expectancy_net_r": -0.4899675567326508,
+    "expectancy_net_pct": -0.0033899149532764256,
+    "profit_factor_net": 0.3980241437295453,
+    "avg_win_net_r": 0.9207417295620136,
+    "avg_loss_net_r": -1.2557811692926115,
+    "avg_win_net_pct": 0.02716462448214664,
+    "avg_loss_net_pct": -0.01997666493250609,
+    "max_drawdown_pct": -56.13427763652461,
+    "final_equity": 4467.091743079126,
+    "sharpe_ratio": -2.7938081569477906,
+    "sortino_ratio": -4.698597176776293,
+    "sharpe_assumptions": "Annualized using active trade frequency (162 trades across 79.6 days)",
+    "avg_holding_hours": 3.6604938271604937,
+    "median_holding_hours": 1.75,
+    "total_fees_pct": 0.05240000000000001,
+    "total_slippage_pct": 0.655,
+    "total_funding_pct": 0.0083,
+    "win_rate_gross": 0.4074074074074074,
+    "expectancy_gross_r": -0.004354790400107673,
+    "profit_factor_gross": 0.9925993617292953,
+    "exit_counts": {
+      "stop": 95,
+      "target": 62,
+      "time_stop": 5
+    },
+    "ambiguous_same_bar_count": 1
+  }
+}

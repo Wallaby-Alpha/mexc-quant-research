@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MEXC Swing-High Retest — Setup & Trade Viewer</title>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+    <style>
+        :root {
+            --bg-primary: #0f172a;
+            --bg-secondary: #1e293b;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --accent-green: #22c55e;
+            --accent-red: #ef4444;
+            --accent-blue: #3b82f6;
+            --border-color: #334155;
+        }
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+        }
+        .header {
+            margin-bottom: 24px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 16px;
+        }
+        h1 {
+            margin: 0 0 8px 0;
+            font-size: 24px;
+            font-weight: 700;
+        }
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+        .layout {
+            display: grid;
+            grid-template-columns: 320px 1fr;
+            gap: 20px;
+            height: calc(100vh - 120px);
+        }
+        .sidebar {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            overflow-y: auto;
+            padding: 12px;
+        }
+        .trade-card {
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid var(--border-color);
+            margin-bottom: 10px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            background: #182234;
+        }
+        .trade-card:hover, .trade-card.active {
+            border-color: var(--accent-blue);
+            background: #233148;
+        }
+        .trade-header {
+            display: flex;
+            justify-content: space-between;
+            font-weight: 600;
+            font-size: 14px;
+            margin-bottom: 4px;
+        }
+        .badge-win { color: var(--accent-green); }
+        .badge-loss { color: var(--accent-red); }
+        .trade-meta {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+        .main-view {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        .chart-box {
+            flex: 1;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            padding: 16px;
+            min-height: 480px;
+        }
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(6, 1fr);
+            gap: 12px;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            padding: 14px;
+        }
+        .metric-item {
+            display: flex;
+            flex-direction: column;
+        }
+        .metric-label {
+            font-size: 11px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+        }
+        .metric-val {
+            font-size: 16px;
+            font-weight: 600;
+            margin-top: 2px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>MEXC Swing-High Retest — Setup & Trade Viewer</h1>
+        <div class="subtitle">Interactive Bar-by-Bar Trade Inspection • Net-of-Cost Execution • Zero Lookahead</div>
+    </div>
+    <div class="layout">
+        <div class="sidebar" id="tradeList"></div>
+        <div class="main-view">
+            <div class="metrics-grid" id="metricsBox"></div>
+            <div class="chart-box" id="chart"></div>
+        </div>
+    </div>
+
+    <script>
+        const trades = [{"trade_id": "MUBARAK_USDT_202510040545_1", "event_id": "MUBARAK_USDT_202510040445_ATR_0.50", "symbol": "MUBARAK_USDT", "entry_mode": "Entry_A", "signal_time": "2025-10-04 05:45:00+00:00", "entry_time": "2025-10-04 05:45:00+00:00", "exit_time": "2025-10-04 07:00:00+00:00", "universe_rank": null, "volume_24h_usdt": 20904.588, "trend_state": "Trend_C", "trend_a": true, "trend_b": true, "trend_c": true, "trend_d": true, "swing_high_time": "2025-10-04 04:45:00+00:00", "swing_high_price": 0.03528, "swing_low_time": "2025-10-04 02:15:00+00:00", "swing_low_price": 0.03367, "atr_ref": 0.00031900679053098257, "atr_entry": 0.00031900679053098257, "impulse": 0.0016100000000000003, "impulse_atr": 5.046914510252828, "running_pullback_low": 0.03479, "pullback_depth_atr": 1.5360174596421565, "retracement_pct": 30.434782608695482, "entry_price_raw": 0.03483, "entry_price": 0.034917075, "stop_price": 0.034710248302367255, "target_price": 0.03528, "potential_rr": 3.7577755380141893, "exit_price_raw": 0.03528, "exit_price": 0.03528, "exit_reason": "target", "bars_held": 5, "holding_time_minutes": 75.0, "time_to_target_bars": 5.0, "time_to_target_minutes": 75.0, "gross_pnl_pct": 0.012919896640826845, "gross_pnl_r": 3.7577755380141893, "entry_fee": 0.0002, "exit_fee": 0.0, "total_fees": 0.0002, "slippage_cost": 0.0025, "funding_cost": 0.0, "net_pnl_pct": 0.01019391186117394, "net_pnl_r": 1.7209653737837838, "mfe_price": 0.03571, "mfe_atr": 2.485605396299517, "mfe_r": 3.833765220232715, "mae_price": 0.03474, "mae_atr": 0.5550822278900702, "mae_r": 0.8561515608319871, "retested_high": true, "broke_high": true, "eventually_broke_pullback_low": false, "ambiguous_same_bar": false, "btc_regime": "BTC_Non_Uptrend", "btc_above_ema50": true, "btc_above_ema200": true, "entry_time_dt": "2025-10-04 05:45:00+00:00", "candles": [{"time": "2025-10-04 01:45:00+00:00", "open": 0.03399, "high": 0.03407, "low": 0.03379, "close": 0.03398}, {"time": "2025-10-04 02:00:00+00:00", "open": 0.03398, "high": 0.03428, "low": 0.03394, "close": 0.03395}, {"time": "2025-10-04 02:15:00+00:00", "open": 0.03395, "high": 0.03396, "low": 0.03367, "close": 0.03382}, {"time": "2025-10-04 02:30:00+00:00", "open": 0.03382, "high": 0.03394, "low": 0.03375, "close": 0.03393}, {"time": "2025-10-04 02:45:00+00:00", "open": 0.03393, "high": 0.03422, "low": 0.03386, "close": 0.03409}, {"time": "2025-10-04 03:00:00+00:00", "open": 0.03409, "high": 0.03416, "low": 0.03391, "close": 0.03394}, {"time": "2025-10-04 03:15:00+00:00", "open": 0.03394, "high": 0.03419, "low": 0.03387, "close": 0.03415}, {"time": "2025-10-04 03:30:00+00:00", "open": 0.03415, "high": 0.03428, "low": 0.03411, "close": 0.03418}, {"time": "2025-10-04 03:45:00+00:00", "open": 0.03418, "high": 0.03433, "low": 0.03403, "close": 0.03424}, {"time": "2025-10-04 04:00:00+00:00", "open": 0.03424, "high": 0.03442, "low": 0.03417, "close": 0.03418}, {"time": "2025-10-04 04:15:00+00:00", "open": 0.03418, "high": 0.03423, "low": 0.03395, "close": 0.03407}, {"time": "2025-10-04 04:30:00+00:00", "open": 0.03407, "high": 0.03456, "low": 0.034, "close": 0.03454}, {"time": "2025-10-04 04:45:00+00:00", "open": 0.03454, "high": 0.03528, "low": 0.03454, "close": 0.03502}, {"time": "2025-10-04 05:00:00+00:00", "open": 0.03502, "high": 0.03527, "low": 0.03479, "close": 0.03519}, {"time": "2025-10-04 05:15:00+00:00", "open": 0.03519, "high": 0.03521, "low": 0.03492, "close": 0.03493}, {"time": "2025-10-04 05:30:00+00:00", "open": 0.03493, "high": 0.03508, "low": 0.03481, "close": 0.03483}, {"time": "2025-10-04 05:45:00+00:00", "open": 0.03483, "high": 0.0351, "low": 0.03474, "close": 0.03501}, {"time": "2025-10-04 06:00:00+00:00", "open": 0.03501, "high": 0.03505, "low": 0.03479, "close": 0.03484}, {"time": "2025-10-04 06:15:00+00:00", "open": 0.03484, "high": 0.035, "low": 0.03474, "close": 0.03491}, {"time": "2025-10-04 06:30:00+00:00", "open": 0.03491, "high": 0.03517, "low": 0.03488, "close": 0.0351}, {"time": "2025-10-04 06:45:00+00:00", "open": 0.0351, "high": 0.03571, "low": 0.03505, "close": 0.03538}, {"time": "2025-10-04 07:00:00+00:00", "open": 0.03538, "high": 0.03538, "low": 0.03489, "close": 0.03492}, {"time": "2025-10-04 07:15:00+00:00", "open": 0.03492, "high": 0.03508, "low": 0.03481, "close": 0.03494}, {"time": "2025-10-04 07:30:00+00:00", "open": 0.03494, "high": 0.03508, "low": 0.03475, "close": 0.03479}, {"time": "2025-10-04 07:45:00+00:00", "open": 0.03479, "high": 0.03483, "low": 0.03447, "close": 0.03462}, {"time": "2025-10-04 08:00:00+00:00", "open": 0.03462, "high": 0.03473, "low": 0.03449, "close": 0.03451}, {"time": "2025-10-04 08:15:00+00:00", "open": 0.03451, "high": 0.03451, "low": 0.03432, "close": 0.03432}, {"time": "2025-10-04 08:30:00+00:00", "open": 0.03432, "high": 0.03478, "low": 0.0342, "close": 0.0343}, {"time": "2025-10-04 08:45:00+00:00", "open": 0.0343, "high": 0.03443, "low": 0.03419, "close": 0.03434}, {"time": "2025-10-04 09:00:00+00:00", "open": 0.03434, "high": 0.03455, "low": 0.03413, "close": 0.03452}]}, {"trade_id": "CVX_USDT_202510040600_1", "event_id": "CVX_USDT_202510040500_ATR_0.50", "symbol": "CVX_USDT", "entry_mode": "Entry_A", "signal_time": "2025-10-04 06:00:00+00:00", "entry_time": "2025-10-04 06:00:00+00:00", "exit_time": "2025-10-04 13:45:00+00:00", "universe_rank": null, "volume_24h_usdt": 6559.027, "trend_state": "Trend_C", "trend_a": true, "trend_b": true, "trend_c": true, "trend_d": true, "swing_high_time": "2025-10-04 05:00:00+00:00", "swing_high_price": 3.769, "swing_low_time": "2025-10-03 23:00:00+00:00", "swing_low_price": 3.693, "atr_ref": 0.027518325126077586, "atr_entry": 0.027518325126077586, "impulse": 0.07600000000000007, "impulse_atr": 2.7617959905553664, "running_pullback_low": 3.613, "pullback_depth_atr": 5.668949664824173, "retracement_pct": 205.26315789473685, "entry_price_raw": 3.622, "entry_price": 3.6310549999999995, "stop_price": 3.6061204187184805, "target_price": 3.769, "potential_rr": 9.25717104210291, "exit_price_raw": 3.769, "exit_price": 3.769, "exit_reason": "target", "bars_held": 31, "holding_time_minutes": 465.0, "time_to_target_bars": 31.0, "time_to_target_minutes": 465.0, "gross_pnl_pct": 0.04058531198233027, "gross_pnl_r": 9.25717104210291, "entry_fee": 0.0002, "exit_fee": 0.0, "total_fees": 0.0002, "slippage_cost": 0.0025, "funding_cost": 0.0001, "net_pnl_pct": 0.03769033614197545, "net_pnl_r": 5.4885895999158265, "mfe_price": 3.779, "mfe_atr": 5.376235629246243, "mfe_r": 5.933326023391243, "mae_price": 3.609, "mae_atr": 0.8014659285749625, "mae_r": 0.8845145523396564, "retested_high": true, "broke_high": true, "eventually_broke_pullback_low": false, "ambiguous_same_bar": false, "btc_regime": "BTC_Non_Uptrend", "btc_above_ema50": true, "btc_above_ema200": true, "entry_time_dt": "2025-10-04 06:00:00+00:00", "candles": [{"time": "2025-10-04 02:00:00+00:00", "open": 3.716, "high": 3.736, "low": 3.701, "close": 3.703}, {"time": "2025-10-04 02:15:00+00:00", "open": 3.703, "high": 3.733, "low": 3.7, "close": 3.733}, {"time": "2025-10-04 02:30:00+00:00", "open": 3.733, "high": 3.735, "low": 3.716, "close": 3.719}, {"time": "2025-10-04 02:45:00+00:00", "open": 3.719, "high": 3.743, "low": 3.716, "close": 3.719}, {"time": "2025-10-04 03:00:00+00:00", "open": 3.719, "high": 3.721, "low": 3.699, "close": 3.702}, {"time": "2025-10-04 03:15:00+00:00", "open": 3.702, "high": 3.717, "low": 3.696, "close": 3.717}, {"time": "2025-10-04 03:30:00+00:00", "open": 3.717, "high": 3.719, "low": 3.708, "close": 3.713}, {"time": "2025-10-04 03:45:00+00:00", "open": 3.713, "high": 3.721, "low": 3.708, "close": 3.717}, {"time": "2025-10-04 04:00:00+00:00", "open": 3.717, "high": 3.728, "low": 3.711, "close": 3.712}, {"time": "2025-10-04 04:15:00+00:00", "open": 3.712, "high": 3.716, "low": 3.706, "close": 3.711}, {"time": "2025-10-04 04:30:00+00:00", "open": 3.711, "high": 3.723, "low": 3.707, "close": 3.722}, {"time": "2025-10-04 04:45:00+00:00", "open": 3.722, "high": 3.745, "low": 3.722, "close": 3.725}, {"time": "2025-10-04 05:00:00+00:00", "open": 3.725, "high": 3.769, "low": 3.722, "close": 3.764}, {"time": "2025-10-04 05:15:00+00:00", "open": 3.764, "high": 3.764, "low": 3.623, "close": 3.632}, {"time": "2025-10-04 05:30:00+00:00", "open": 3.632, "high": 3.633, "low": 3.62, "close": 3.622}, {"time": "2025-10-04 05:45:00+00:00", "open": 3.622, "high": 3.625, "low": 3.613, "close": 3.622}, {"time": "2025-10-04 06:00:00+00:00", "open": 3.622, "high": 3.64, "low": 3.622, "close": 3.629}, {"time": "2025-10-04 06:15:00+00:00", "open": 3.629, "high": 3.65, "low": 3.627, "close": 3.64}, {"time": "2025-10-04 06:30:00+00:00", "open": 3.64, "high": 3.642, "low": 3.627, "close": 3.637}, {"time": "2025-10-04 06:45:00+00:00", "open": 3.637, "high": 3.642, "low": 3.628, "close": 3.629}, {"time": "2025-10-04 07:00:00+00:00", "open": 3.629, "high": 3.635, "low": 3.624, "close": 3.632}, {"time": "2025-10-04 07:15:00+00:00", "open": 3.632, "high": 3.633, "low": 3.617, "close": 3.624}, {"time": "2025-10-04 07:30:00+00:00", "open": 3.624, "high": 3.627, "low": 3.62, "close": 3.622}, {"time": "2025-10-04 07:45:00+00:00", "open": 3.622, "high": 3.627, "low": 3.609, "close": 3.625}, {"time": "2025-10-04 08:00:00+00:00", "open": 3.625, "high": 3.636, "low": 3.619, "close": 3.636}, {"time": "2025-10-04 08:15:00+00:00", "open": 3.636, "high": 3.638, "low": 3.619, "close": 3.626}, {"time": "2025-10-04 08:30:00+00:00", "open": 3.626, "high": 3.635, "low": 3.616, "close": 3.621}, {"time": "2025-10-04 08:45:00+00:00", "open": 3.621, "high": 3.652, "low": 3.62, "close": 3.647}, {"time": "2025-10-04 09:00:00+00:00", "open": 3.647, "high": 3.675, "low": 3.642, "close": 3.675}, {"time": "2025-10-04 09:15:00+00:00", "open": 3.675, "high": 3.687, "low": 3.665, "close": 3.682}]}, {"trade_id": "AVAX_USDT_202510040600_1", "event_id": "AVAX_USDT_202510040500_ATR_0.50", "symbol": "AVAX_USDT", "entry_mode": "Entry_A", "signal_time": "2025-10-04 06:00:00+00:00", "entry_time": "2025-10-04 06:00:00+00:00", "exit_time": "2025-10-04 07:30:00+00:00", "universe_rank": null, "volume_24h_usdt": 1193598.8854, "trend_state": "Trend_C", "trend_a": true, "trend_b": true, "trend_c": true, "trend_d": true, "swing_high_time": "2025-10-04 05:00:00+00:00", "swing_high_price": 31.378, "swing_low_time": "2025-10-04 02:00:00+00:00", "swing_low_price": 31.051, "atr_ref": 0.11863238049130578, "atr_entry": 0.11863238049130578, "impulse": 0.32700000000000173, "impulse_atr": 2.756414384047251, "running_pullback_low": 31.105, "pullback_depth_atr": 2.3012266875990663, "retracement_pct": 83.48623853210955, "entry_price_raw": 31.192, "entry_price": 31.269979999999997, "stop_price": 31.075341904877174, "target_price": 31.378, "potential_rr": 1.5944028556626566, "exit_price_raw": 31.075341904877174, "exit_price": 30.997653550114983, "exit_reason": "stop", "bars_held": 6, "holding_time_minutes": 90.0, "time_to_target_bars": NaN, "time_to_target_minutes": NaN, "gross_pnl_pct": -0.003740000484830284, "gross_pnl_r": -1.0, "entry_fee": 0.0002, "exit_fee": 0.0002, "total_fees": 0.0004, "slippage_cost": 0.005, "funding_cost": 0.0, "net_pnl_pct": -0.009108878287898303, "net_pnl_r": -1.4634054125184208, "mfe_price": 31.23, "mfe_atr": 0.0, "mfe_r": 0.0, "mae_price": 30.929, "mae_atr": 2.8742574210165808, "mae_r": 1.7518667133729864, "retested_high": false, "broke_high": false, "eventually_broke_pullback_low": true, "ambiguous_same_bar": false, "btc_regime": "BTC_Non_Uptrend", "btc_above_ema50": true, "btc_above_ema200": true, "entry_time_dt": "2025-10-04 06:00:00+00:00", "candles": [{"time": "2025-10-04 02:00:00+00:00", "open": 31.211, "high": 31.272, "low": 31.051, "close": 31.082}, {"time": "2025-10-04 02:15:00+00:00", "open": 31.082, "high": 31.221, "low": 31.053, "close": 31.221}, {"time": "2025-10-04 02:30:00+00:00", "open": 31.221, "high": 31.238, "low": 31.153, "close": 31.206}, {"time": "2025-10-04 02:45:00+00:00", "open": 31.206, "high": 31.22, "low": 31.155, "close": 31.174}, {"time": "2025-10-04 03:00:00+00:00", "open": 31.174, "high": 31.215, "low": 31.111, "close": 31.118}, {"time": "2025-10-04 03:15:00+00:00", "open": 31.118, "high": 31.183, "low": 31.074, "close": 31.151}, {"time": "2025-10-04 03:30:00+00:00", "open": 31.151, "high": 31.237, "low": 31.123, "close": 31.223}, {"time": "2025-10-04 03:45:00+00:00", "open": 31.223, "high": 31.259, "low": 31.167, "close": 31.22}, {"time": "2025-10-04 04:00:00+00:00", "open": 31.22, "high": 31.305, "low": 31.217, "close": 31.284}, {"time": "2025-10-04 04:15:00+00:00", "open": 31.284, "high": 31.295, "low": 31.157, "close": 31.177}, {"time": "2025-10-04 04:30:00+00:00", "open": 31.177, "high": 31.232, "low": 31.153, "close": 31.187}, {"time": "2025-10-04 04:45:00+00:00", "open": 31.187, "high": 31.219, "low": 31.149, "close": 31.184}, {"time": "2025-10-04 05:00:00+00:00", "open": 31.184, "high": 31.378, "low": 31.167, "close": 31.37}, {"time": "2025-10-04 05:15:00+00:00", "open": 31.37, "high": 31.37, "low": 31.185, "close": 31.219}, {"time": "2025-10-04 05:30:00+00:00", "open": 31.219, "high": 31.241, "low": 31.109, "close": 31.119}, {"time": "2025-10-04 05:45:00+00:00", "open": 31.119, "high": 31.218, "low": 31.105, "close": 31.192}, {"time": "2025-10-04 06:00:00+00:00", "open": 31.192, "high": 31.23, "low": 31.083, "close": 31.11}, {"time": "2025-10-04 06:15:00+00:00", "open": 31.11, "high": 31.186, "low": 31.109, "close": 31.156}, {"time": "2025-10-04 06:30:00+00:00", "open": 31.156, "high": 31.2, "low": 31.14, "close": 31.17}, {"time": "2025-10-04 06:45:00+00:00", "open": 31.17, "high": 31.178, "low": 31.108, "close": 31.117}, {"time": "2025-10-04 07:00:00+00:00", "open": 31.117, "high": 31.137, "low": 31.08, "close": 31.101}, {"time": "2025-10-04 07:15:00+00:00", "open": 31.101, "high": 31.101, "low": 30.929, "close": 30.945}, {"time": "2025-10-04 07:30:00+00:00", "open": 30.945, "high": 30.961, "low": 30.851, "close": 30.851}, {"time": "2025-10-04 07:45:00+00:00", "open": 30.851, "high": 30.859, "low": 30.766, "close": 30.789}, {"time": "2025-10-04 08:00:00+00:00", "open": 30.789, "high": 30.792, "low": 30.683, "close": 30.699}, {"time": "2025-10-04 08:15:00+00:00", "open": 30.699, "high": 30.699, "low": 30.624, "close": 30.635}, {"time": "2025-10-04 08:30:00+00:00", "open": 30.635, "high": 30.645, "low": 30.51, "close": 30.556}, {"time": "2025-10-04 08:45:00+00:00", "open": 30.556, "high": 30.61, "low": 30.523, "close": 30.586}, {"time": "2025-10-04 09:00:00+00:00", "open": 30.586, "high": 30.679, "low": 30.525, "close": 30.66}, {"time": "2025-10-04 09:15:00+00:00", "open": 30.66, "high": 30.674, "low": 30.579, "close": 30.614}]}, {"trade_id": "NEO_USDT_202510040600_1", "event_id": "NEO_USDT_202510040500_ATR_0.50", "symbol": "NEO_USDT", "entry_mode": "Entry_A", "signal_time": "2025-10-04 06:00:00+00:00", "entry_time": "2025-10-04 06:00:00+00:00", "exit_time": "2025-10-04 06:15:00+00:00", "universe_rank": null, "volume_24h_usdt": 3501.2255, "trend_state": "Trend_C", "trend_a": true, "trend_b": true, "trend_c": true, "trend_d": true, "swing_high_time": "2025-10-04 05:00:00+00:00", "swing_high_price": 6.348, "swing_low_time": "2025-10-04 04:15:00+00:00", "swing_low_price": 6.279, "atr_ref": 0.030069076996157046, "atr_entry": 0.030069076996157046, "impulse": 0.06899999999999995, "impulse_atr": 2.294716263117037, "running_pullback_low": 6.266, "pullback_depth_atr": 2.727054109791258, "retracement_pct": 118.8405797101448, "entry_price_raw": 6.275, "entry_price": 6.2906875, "stop_price": 6.258482730750961, "target_price": 6.348, "potential_rr": 4.419616759849392, "exit_price_raw": 6.258482730750961, "exit_price": 6.242836523924084, "exit_reason": "stop", "bars_held": 1, "holding_time_minutes": 15.0, "time_to_target_bars": NaN, "time_to_target_minutes": NaN, "gross_pnl_pct": -0.0026322341432732112, "gross_pnl_r": -1.0, "entry_fee": 0.0002, "exit_fee": 0.0002, "total_fees": 0.0004, "slippage_cost": 0.005, "funding_cost": 0.0, "net_pnl_pct": -0.008006636965501083, "net_pnl_r": -1.5639686993695465, "mfe_price": 6.284, "mfe_atr": 0.0, "mfe_r": 0.0, "mae_price": 6.25, "mae_atr": 1.3531343181967241, "mae_r": 1.263399830173108, "retested_high": false, "broke_high": false, "eventually_broke_pullback_low": true, "ambiguous_same_bar": false, "btc_regime": "BTC_Non_Uptrend", "btc_above_ema50": true, "btc_above_ema200": true, "entry_time_dt": "2025-10-04 06:00:00+00:00", "candles": [{"time": "2025-10-04 02:00:00+00:00", "open": 6.427, "high": 6.43, "low": 6.359, "close": 6.36}, {"time": "2025-10-04 02:15:00+00:00", "open": 6.36, "high": 6.387, "low": 6.349, "close": 6.364}, {"time": "2025-10-04 02:30:00+00:00", "open": 6.364, "high": 6.377, "low": 6.355, "close": 6.373}, {"time": "2025-10-04 02:45:00+00:00", "open": 6.373, "high": 6.393, "low": 6.369, "close": 6.375}, {"time": "2025-10-04 03:00:00+00:00", "open": 6.375, "high": 6.383, "low": 6.324, "close": 6.33}, {"time": "2025-10-04 03:15:00+00:00", "open": 6.33, "high": 6.341, "low": 6.321, "close": 6.331}, {"time": "2025-10-04 03:30:00+00:00", "open": 6.331, "high": 6.335, "low": 6.318, "close": 6.322}, {"time": "2025-10-04 03:45:00+00:00", "open": 6.322, "high": 6.324, "low": 6.311, "close": 6.316}, {"time": "2025-10-04 04:00:00+00:00", "open": 6.316, "high": 6.33, "low": 6.311, "close": 6.312}, {"time": "2025-10-04 04:15:00+00:00", "open": 6.312, "high": 6.316, "low": 6.279, "close": 6.288}, {"time": "2025-10-04 04:30:00+00:00", "open": 6.288, "high": 6.304, "low": 6.28, "close": 6.302}, {"time": "2025-10-04 04:45:00+00:00", "open": 6.302, "high": 6.316, "low": 6.296, "close": 6.302}, {"time": "2025-10-04 05:00:00+00:00", "open": 6.302, "high": 6.348, "low": 6.295, "close": 6.343}, {"time": "2025-10-04 05:15:00+00:00", "open": 6.343, "high": 6.343, "low": 6.314, "close": 6.316}, {"time": "2025-10-04 05:30:00+00:00", "open": 6.316, "high": 6.319, "low": 6.29, "close": 6.29}, {"time": "2025-10-04 05:45:00+00:00", "open": 6.29, "high": 6.297, "low": 6.266, "close": 6.275}, {"time": "2025-10-04 06:00:00+00:00", "open": 6.275, "high": 6.284, "low": 6.25, "close": 6.255}, {"time": "2025-10-04 06:15:00+00:00", "open": 6.255, "high": 6.298, "low": 6.254, "close": 6.275}, {"time": "2025-10-04 06:30:00+00:00", "open": 6.275, "high": 6.276, "low": 6.261, "close": 6.267}, {"time": "2025-10-04 06:45:00+00:00", "open": 6.267, "high": 6.291, "low": 6.267, "close": 6.289}, {"time": "2025-10-04 07:00:00+00:00", "open": 6.289, "high": 6.292, "low": 6.279, "close": 6.288}, {"time": "2025-10-04 07:15:00+00:00", "open": 6.288, "high": 6.294, "low": 6.272, "close": 6.286}, {"time": "2025-10-04 07:30:00+00:00", "open": 6.286, "high": 6.3, "low": 6.282, "close": 6.284}, {"time": "2025-10-04 07:45:00+00:00", "open": 6.284, "high": 6.284, "low": 6.267, "close": 6.279}, {"time": "2025-10-04 08:00:00+00:00", "open": 6.279, "high": 6.287, "low": 6.262, "close": 6.262}, {"time": "2025-10-04 08:15:00+00:00", "open": 6.262, "high": 6.264, "low": 6.239, "close": 6.247}, {"time": "2025-10-04 08:30:00+00:00", "open": 6.247, "high": 6.249, "low": 6.217, "close": 6.229}, {"time": "2025-10-04 08:45:00+00:00", "open": 6.229, "high": 6.236, "low": 6.219, "close": 6.219}, {"time": "2025-10-04 09:00:00+00:00", "open": 6.219, "high": 6.246, "low": 6.213, "close": 6.244}, {"time": "2025-10-04 09:15:00+00:00", "open": 6.244, "high": 6.257, "low": 6.231, "close": 6.237}]}, {"trade_id": "GOOGLSTOCK_USDT_202604040830_169", "event_id": "GOOGLSTOCK_USDT_202604040730_ATR_0.50", "symbol": "GOOGLSTOCK_USDT", "entry_mode": "Entry_A", "signal_time": "2026-04-04 08:30:00+00:00", "entry_time": "2026-04-04 08:30:00+00:00", "exit_time": "2026-04-04 09:30:00+00:00", "universe_rank": null, "volume_24h_usdt": 2105.8609, "trend_state": "Trend_C", "trend_a": true, "trend_b": true, "trend_c": true, "trend_d": true, "swing_high_time": "2026-04-04 07:30:00+00:00", "swing_high_price": 295.31, "swing_low_time": "2026-04-04 00:00:00+00:00", "swing_low_price": 294.38, "atr_ref": 0.1647501826457991, "atr_entry": 0.1647501826457991, "impulse": 0.9300000000000068, "impulse_atr": 5.6449102821296355, "running_pullback_low": 294.78, "pullback_depth_atr": 3.216991881213819, "retracement_pct": 56.98924731183072, "entry_price_raw": 294.96, "entry_price": 295.69739999999996, "stop_price": 294.73881245433853, "target_price": 295.31, "potential_rr": 1.5823675738765697, "exit_price_raw": 294.73881245433853, "exit_price": 294.0019654232027, "exit_reason": "stop", "bars_held": 4, "holding_time_minutes": 60.0, "time_to_target_bars": NaN, "time_to_target_minutes": NaN, "gross_pnl_pct": -0.000749889970373782, "gross_pnl_r": -1.0, "entry_fee": 0.0002, "exit_fee": 0.0002, "total_fees": 0.0004, "slippage_cost": 0.005, "funding_cost": 0.0, "net_pnl_pct": -0.006133681042840601, "net_pnl_r": -1.892068747404581, "mfe_price": 295.12, "mfe_atr": 0.0, "mfe_r": 0.0, "mae_price": 294.62, "mae_atr": 6.539598212866848, "mae_r": 1.1239453348588448, "retested_high": false, "broke_high": false, "eventually_broke_pullback_low": true, "ambiguous_same_bar": false, "btc_regime": "BTC_Non_Uptrend", "btc_above_ema50": false, "btc_above_ema200": false, "entry_time_dt": "2026-04-04 08:30:00+00:00", "candles": [{"time": "2026-04-04 04:30:00+00:00", "open": 294.99, "high": 295.01, "low": 294.9, "close": 294.94}, {"time": "2026-04-04 04:45:00+00:00", "open": 294.94, "high": 295.07, "low": 294.93, "close": 295.07}, {"time": "2026-04-04 05:00:00+00:00", "open": 295.07, "high": 295.08, "low": 294.96, "close": 295.05}, {"time": "2026-04-04 05:15:00+00:00", "open": 295.05, "high": 295.05, "low": 294.9, "close": 294.95}, {"time": "2026-04-04 05:30:00+00:00", "open": 294.95, "high": 295.12, "low": 294.92, "close": 295.03}, {"time": "2026-04-04 05:45:00+00:00", "open": 295.03, "high": 295.11, "low": 295.03, "close": 295.09}, {"time": "2026-04-04 06:00:00+00:00", "open": 295.09, "high": 295.18, "low": 295.04, "close": 295.18}, {"time": "2026-04-04 06:15:00+00:00", "open": 295.18, "high": 295.2, "low": 295.1, "close": 295.14}, {"time": "2026-04-04 06:30:00+00:00", "open": 295.14, "high": 295.2, "low": 295.09, "close": 295.2}, {"time": "2026-04-04 06:45:00+00:00", "open": 295.2, "high": 295.2, "low": 295.05, "close": 295.06}, {"time": "2026-04-04 07:00:00+00:00", "open": 295.06, "high": 295.2, "low": 295.06, "close": 295.2}, {"time": "2026-04-04 07:15:00+00:00", "open": 295.2, "high": 295.2, "low": 295.19, "close": 295.19}, {"time": "2026-04-04 07:30:00+00:00", "open": 295.19, "high": 295.31, "low": 295.19, "close": 295.28}, {"time": "2026-04-04 07:45:00+00:00", "open": 295.28, "high": 295.3, "low": 294.97, "close": 295.0}, {"time": "2026-04-04 08:00:00+00:00", "open": 295.0, "high": 295.02, "low": 294.78, "close": 294.91}, {"time": "2026-04-04 08:15:00+00:00", "open": 294.91, "high": 294.98, "low": 294.89, "close": 294.96}, {"time": "2026-04-04 08:30:00+00:00", "open": 294.96, "high": 294.97, "low": 294.91, "close": 294.93}, {"time": "2026-04-04 08:45:00+00:00", "open": 294.93, "high": 295.02, "low": 294.92, "close": 294.99}, {"time": "2026-04-04 09:00:00+00:00", "open": 294.99, "high": 295.12, "low": 294.83, "close": 294.9}, {"time": "2026-04-04 09:15:00+00:00", "open": 294.9, "high": 294.98, "low": 294.62, "close": 294.68}, {"time": "2026-04-04 09:30:00+00:00", "open": 294.68, "high": 294.97, "low": 294.68, "close": 294.96}, {"time": "2026-04-04 09:45:00+00:00", "open": 294.96, "high": 295.03, "low": 294.87, "close": 294.88}, {"time": "2026-04-04 10:00:00+00:00", "open": 294.88, "high": 295.02, "low": 294.87, "close": 294.97}, {"time": "2026-04-04 10:15:00+00:00", "open": 294.97, "high": 295.01, "low": 294.96, "close": 295.0}, {"time": "2026-04-04 10:30:00+00:00", "open": 295.0, "high": 295.05, "low": 294.92, "close": 294.99}, {"time": "2026-04-04 10:45:00+00:00", "open": 294.99, "high": 295.18, "low": 294.86, "close": 295.01}, {"time": "2026-04-04 11:00:00+00:00", "open": 295.01, "high": 295.01, "low": 294.72, "close": 294.8}, {"time": "2026-04-04 11:15:00+00:00", "open": 294.8, "high": 294.83, "low": 294.61, "close": 294.79}, {"time": "2026-04-04 11:30:00+00:00", "open": 294.79, "high": 294.84, "low": 294.58, "close": 294.61}, {"time": "2026-04-04 11:45:00+00:00", "open": 294.61, "high": 294.9, "low": 294.55, "close": 294.9}]}, {"trade_id": "NIL_USDT_202606190300_349", "event_id": "NIL_USDT_202606190200_ATR_0.50", "symbol": "NIL_USDT", "entry_mode": "Entry_A", "signal_time": "2026-06-19 03:00:00+00:00", "entry_time": "2026-06-19 03:00:00+00:00", "exit_time": "2026-06-19 03:30:00+00:00", "universe_rank": null, "volume_24h_usdt": 3280.55022, "trend_state": "Trend_C", "trend_a": true, "trend_b": true, "trend_c": true, "trend_d": false, "swing_high_time": "2026-06-19 02:00:00+00:00", "swing_high_price": 0.04299, "swing_low_time": "2026-06-18 18:00:00+00:00", "swing_low_price": 0.03992, "atr_ref": 0.0004328215062809179, "atr_entry": 0.0004328215062809179, "impulse": 0.0030700000000000033, "impulse_atr": 7.092993198003092, "running_pullback_low": 0.0417, "pullback_depth_atr": 2.980443395903575, "retracement_pct": 42.0195439739413, "entry_price_raw": 0.04194, "entry_price": 0.042044849999999995, "stop_price": 0.041591794623429774, "target_price": 0.04299, "potential_rr": 3.015461766680233, "exit_price_raw": 0.041591794623429774, "exit_price": 0.0414878151368712, "exit_reason": "stop", "bars_held": 2, "holding_time_minutes": 30.0, "time_to_target_bars": NaN, "time_to_target_minutes": NaN, "gross_pnl_pct": -0.008302464868150302, "gross_pnl_r": -1.0, "entry_fee": 0.0002, "exit_fee": 0.0002, "total_fees": 0.0004, "slippage_cost": 0.005, "funding_cost": 0.0, "net_pnl_pct": -0.013648587237885153, "net_pnl_r": -1.2666283920368673, "mfe_price": 0.04196, "mfe_atr": 0.0, "mfe_r": 0.0, "mae_price": 0.04125, "mae_atr": 1.8364383203363845, "mae_r": 1.7544212939647055, "retested_high": false, "broke_high": false, "eventually_broke_pullback_low": true, "ambiguous_same_bar": false, "btc_regime": "BTC_Non_Uptrend", "btc_above_ema50": false, "btc_above_ema200": false, "entry_time_dt": "2026-06-19 03:00:00+00:00", "candles": [{"time": "2026-06-18 23:00:00+00:00", "open": 0.04187, "high": 0.04193, "low": 0.04154, "close": 0.04154}, {"time": "2026-06-18 23:15:00+00:00", "open": 0.04154, "high": 0.04183, "low": 0.04151, "close": 0.04178}, {"time": "2026-06-18 23:30:00+00:00", "open": 0.04178, "high": 0.04187, "low": 0.04171, "close": 0.04185}, {"time": "2026-06-18 23:45:00+00:00", "open": 0.04185, "high": 0.04189, "low": 0.04157, "close": 0.04175}, {"time": "2026-06-19 00:00:00+00:00", "open": 0.04175, "high": 0.04221, "low": 0.04168, "close": 0.04215}, {"time": "2026-06-19 00:15:00+00:00", "open": 0.04215, "high": 0.04279, "low": 0.04213, "close": 0.04256}, {"time": "2026-06-19 00:30:00+00:00", "open": 0.04256, "high": 0.04265, "low": 0.04203, "close": 0.0422}, {"time": "2026-06-19 00:45:00+00:00", "open": 0.0422, "high": 0.04238, "low": 0.04206, "close": 0.04237}, {"time": "2026-06-19 01:00:00+00:00", "open": 0.04237, "high": 0.04252, "low": 0.04227, "close": 0.04247}, {"time": "2026-06-19 01:15:00+00:00", "open": 0.04247, "high": 0.04282, "low": 0.04236, "close": 0.04239}, {"time": "2026-06-19 01:30:00+00:00", "open": 0.04239, "high": 0.04259, "low": 0.0423, "close": 0.04258}, {"time": "2026-06-19 01:45:00+00:00", "open": 0.04258, "high": 0.04267, "low": 0.04231, "close": 0.0426}, {"time": "2026-06-19 02:00:00+00:00", "open": 0.0426, "high": 0.04299, "low": 0.04259, "close": 0.04276}, {"time": "2026-06-19 02:15:00+00:00", "open": 0.04276, "high": 0.04282, "low": 0.04254, "close": 0.04274}, {"time": "2026-06-19 02:30:00+00:00", "open": 0.04274, "high": 0.0428, "low": 0.04257, "close": 0.04272}, {"time": "2026-06-19 02:45:00+00:00", "open": 0.04272, "high": 0.04273, "low": 0.0417, "close": 0.04194}, {"time": "2026-06-19 03:00:00+00:00", "open": 0.04194, "high": 0.04196, "low": 0.04162, "close": 0.04166}, {"time": "2026-06-19 03:15:00+00:00", "open": 0.04166, "high": 0.0417, "low": 0.04125, "close": 0.04162}, {"time": "2026-06-19 03:30:00+00:00", "open": 0.04162, "high": 0.04162, "low": 0.0413, "close": 0.04146}, {"time": "2026-06-19 03:45:00+00:00", "open": 0.04146, "high": 0.04174, "low": 0.04135, "close": 0.04164}, {"time": "2026-06-19 04:00:00+00:00", "open": 0.04164, "high": 0.04164, "low": 0.0408, "close": 0.04139}, {"time": "2026-06-19 04:15:00+00:00", "open": 0.04139, "high": 0.04157, "low": 0.04118, "close": 0.0412}, {"time": "2026-06-19 04:30:00+00:00", "open": 0.0412, "high": 0.04121, "low": 0.04085, "close": 0.04103}, {"time": "2026-06-19 04:45:00+00:00", "open": 0.04103, "high": 0.04104, "low": 0.04049, "close": 0.0406}, {"time": "2026-06-19 05:00:00+00:00", "open": 0.0406, "high": 0.04095, "low": 0.04058, "close": 0.04093}, {"time": "2026-06-19 05:15:00+00:00", "open": 0.04093, "high": 0.04099, "low": 0.04083, "close": 0.04093}, {"time": "2026-06-19 05:30:00+00:00", "open": 0.04093, "high": 0.04098, "low": 0.04075, "close": 0.04092}, {"time": "2026-06-19 05:45:00+00:00", "open": 0.04092, "high": 0.04106, "low": 0.04092, "close": 0.04103}, {"time": "2026-06-19 06:00:00+00:00", "open": 0.04103, "high": 0.04117, "low": 0.04094, "close": 0.04116}, {"time": "2026-06-19 06:15:00+00:00", "open": 0.04116, "high": 0.04132, "low": 0.04114, "close": 0.0412}]}];
+        let activeIdx = 0;
+
+        function renderSidebar() {
+            const listEl = document.getElementById("tradeList");
+            listEl.innerHTML = "";
+            trades.forEach((t, i) => {
+                const isWin = t.net_pnl_r > 0;
+                const card = document.createElement("div");
+                card.className = "trade-card" + (i === activeIdx ? " active" : "");
+                card.innerHTML = `
+                    <div class="trade-header">
+                        <span>${t.symbol}</span>
+                        <span class="${isWin ? 'badge-win' : 'badge-loss'}">${t.net_pnl_r >= 0 ? '+' : ''}${t.net_pnl_r.toFixed(2)} R</span>
+                    </div>
+                    <div class="trade-meta">
+                        <div>${t.entry_time.split('T')[0]} • ${t.exit_reason}</div>
+                        <div>Mode: ${t.entry_mode} • Hold: ${t.holding_time_minutes}m</div>
+                    </div>
+                `;
+                card.onclick = () => {
+                    activeIdx = i;
+                    renderSidebar();
+                    renderView();
+                };
+                listEl.appendChild(card);
+            });
+        }
+
+        function renderView() {
+            const t = trades[activeIdx];
+            if (!t) return;
+
+            // Render Metrics
+            const mBox = document.getElementById("metricsBox");
+            mBox.innerHTML = `
+                <div class="metric-item">
+                    <span class="metric-label">Symbol / ID</span>
+                    <span class="metric-val">${t.symbol}</span>
+                </div>
+                <div class="metric-item">
+                    <span class="metric-label">Net Return</span>
+                    <span class="metric-val" style="color: ${t.net_pnl_r >= 0 ? 'var(--accent-green)' : 'var(--accent-red)'}">${t.net_pnl_r.toFixed(2)} R (${(t.net_pnl_pct * 100).toFixed(2)}%)</span>
+                </div>
+                <div class="metric-item">
+                    <span class="metric-label">Gross Return</span>
+                    <span class="metric-val">${t.gross_pnl_r.toFixed(2)} R (${(t.gross_pnl_pct * 100).toFixed(2)}%)</span>
+                </div>
+                <div class="metric-item">
+                    <span class="metric-label">Exit Reason</span>
+                    <span class="metric-val">${t.exit_reason}</span>
+                </div>
+                <div class="metric-item">
+                    <span class="metric-label">Fees + Slippage</span>
+                    <span class="metric-val">${((t.total_fees + t.slippage_cost) * 10000).toFixed(1)} bps</span>
+                </div>
+                <div class="metric-item">
+                    <span class="metric-label">MFE / MAE</span>
+                    <span class="metric-val">${t.mfe_r.toFixed(2)}R / ${t.mae_r.toFixed(2)}R</span>
+                </div>
+            `;
+
+            // Synthesize simple illustrative price path for chart
+            const bars = t.candles || [];
+            if (bars.length > 0) {
+                const trace = {
+                    x: bars.map(b => b.time),
+                    open: bars.map(b => b.open),
+                    high: bars.map(b => b.high),
+                    low: bars.map(b => b.low),
+                    close: bars.map(b => b.close),
+                    type: 'candlestick',
+                    name: t.symbol,
+                    increasing: {line: {color: '#22c55e'}},
+                    decreasing: {line: {color: '#ef4444'}}
+                };
+
+                const layout = {
+                    title: `${t.symbol} — ${t.trade_id} (${t.entry_mode})`,
+                    dragmode: 'zoom',
+                    showlegend: false,
+                    xaxis: {rangeslider: {visible: false}, gridcolor: '#334155'},
+                    yaxis: {gridcolor: '#334155'},
+                    paper_bgcolor: '#1e293b',
+                    plot_bgcolor: '#1e293b',
+                    font: {color: '#f8fafc'},
+                    shapes: [
+                        // Target
+                        {type: 'line', xref: 'paper', x0: 0, x1: 1, y0: t.target_price, y1: t.target_price, line: {color: '#22c55e', width: 2, dash: 'dash'}},
+                        // Entry
+                        {type: 'line', xref: 'paper', x0: 0, x1: 1, y0: t.entry_price, y1: t.entry_price, line: {color: '#3b82f6', width: 1.5, dash: 'dot'}},
+                        // Stop
+                        {type: 'line', xref: 'paper', x0: 0, x1: 1, y0: t.stop_price, y1: t.stop_price, line: {color: '#ef4444', width: 2, dash: 'dash'}}
+                    ]
+                };
+                Plotly.newPlot('chart', [trace], layout, {responsive: true});
+            } else {
+                document.getElementById("chart").innerHTML = `
+                    <div style="display:flex;height:100%;align-items:center;justify-content:center;color:var(--text-secondary);flex-direction:column;">
+                        <h3>Trade Detail: ${t.trade_id}</h3>
+                        <p>Entry: ${t.entry_price.toFixed(4)} | Stop: ${t.stop_price.toFixed(4)} | Target: ${t.target_price.toFixed(4)}</p>
+                        <p>Exit: ${t.exit_price.toFixed(4)} (${t.exit_reason}) | Net: ${t.net_pnl_r.toFixed(2)}R</p>
+                    </div>
+                `;
+            }
+        }
+
+        renderSidebar();
+        renderView();
+    </script>
+</body>
+</html>

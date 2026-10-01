@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Large Datasets & Parquet files (Exceeds GitHub 100MB limit)
+data_cache/
+*.parquet
+**/*.parquet
+results/setups_partitions/
+results/outcomes_partitions/
+results/trades.csv
+
+# Credentials & Sensitive Configs
+scanner_config.json
+.env
+*.pem
+*.key
+
+# Local Runtime & Portfolio State
+portfolio_state.json
+*.log
+scanner.log
+scratch/
+scratch_tail.txt
+
+# OS Files
+.DS_Store
+Thumbs.db
