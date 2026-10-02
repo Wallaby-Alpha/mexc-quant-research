@@ -19,12 +19,14 @@ results/trades.csv
 
 # Credentials & Sensitive Configs
 scanner_config.json
+kraken_breakout_config.json
 .env
 *.pem
 *.key
 
 # Local Runtime & Portfolio State
 portfolio_state.json
+kraken_breakout_state.json
 *.log
 scanner.log
 scratch/
