@@ -5,7 +5,7 @@ Runs weekly (every Monday at 00:01 UTC) or on-demand:
 1. Restricts asset universe strictly to the user-specified Breakout tradeable coins (65 assets).
 2. Calculates BTC macro trend (50-day EMA) using PF_XBTUSD daily candles on Kraken.
 3. Ranks Breakout altcoins by 20-day relative strength / momentum.
-4. Selects the Top 10 coins and sizes them conservatively (15% total exposure / 1.5% per coin)
+4. Selects the Top 5 coins and sizes them conservatively (15% total exposure / 3.0% per coin)
    to strictly respect Breakout Prop Firm limits (3.0% max daily loss, 5.0% / 6.0% max drawdown).
 5. Dispatches formatted, actionable signals (BUY / SELL / HOLD) to a dedicated Telegram bot.
 """
@@ -65,7 +65,7 @@ def load_config() -> Dict[str, Any]:
         "telegram_chat_id": os.environ.get("BREAKOUT_TELEGRAM_CHAT_ID", ""),
         "account_size_usd": float(os.environ.get("BREAKOUT_ACCOUNT_SIZE", "100000.0")),
         "total_exposure_pct": float(os.environ.get("BREAKOUT_EXPOSURE_PCT", "15.0")),  # 15% total account exposure
-        "top_k": int(os.environ.get("BREAKOUT_TOP_K", "10")),
+        "top_k": int(os.environ.get("BREAKOUT_TOP_K", "5")),
         "lookback_days": int(os.environ.get("BREAKOUT_LOOKBACK_DAYS", "20")),
         "daily_loss_circuit_breaker_pct": 2.2,  # Alert user if daily portfolio loss reaches -2.2%
         "allowed_coins": DEFAULT_BREAKOUT_UNIVERSE
