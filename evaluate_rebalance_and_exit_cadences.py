@@ -177,91 +177,91 @@ def main():
         daily_records = []
 
         # We simulate on a daily step to properly enforce daily emergency exits
-        day_indices = range(valid_start_idx, len(common_idx) - 1)
-        days_since_rebalance = rebalance_days  # Trigger immediate rebalance on day 0
+        # Run cadence simulation on true cycle holding returns
+        eq = 7000.0
+        curr_w = {}
+        cadence_records = []
 
-        current_coins = []
-        is_in_cash = True
+        # Find rebalance points
+        rebalance_indices = list(range(valid_start_idx, len(common_idx) - rebalance_days, rebalance_days))
 
-        for idx in day_indices:
-            t_day = common_idx[idx]
-            t_next = common_idx[idx + 1]
+        for idx in rebalance_indices:
+            t0 = common_idx[idx]
+            t1 = common_idx[idx + rebalance_days]
 
-            btc_price = s_btc.loc[t_day]
-            btc_ema = s_btc_ema50.loc[t_day]
-            is_btc_bullish = btc_price >= btc_ema
+            btc_price = s_btc.loc[t0]
+            btc_ema = s_btc_ema50.loc[t0]
+            is_cash = btc_price < btc_ema
 
-            target_weights = {}
+            if is_cash:
+                target_coins = []
+                target_w = {}
+                r_period = 0.0
+            else:
+                idx_now = common_idx.get_loc(t0)
+                t_past_30 = common_idx[max(0, idx_now - 30)]
+                btc_30d = (btc_price - s_btc.loc[t_past_30]) / s_btc.loc[t_past_30]
 
-            # Check if emergency daily stop triggered mid-cycle
-            if daily_emergency_stop and not is_btc_bullish and not is_in_cash:
-                # Emergency exit to 100% cash immediately
-                current_coins = []
-                target_weights = {}
-                is_in_cash = True
-                days_since_rebalance = 0
+                cand = []
+                for sym in price_matrix.columns:
+                    s_p = price_matrix[sym]
+                    p0 = s_p.loc[t0]
+                    p_past = s_p.loc[t_past_30]
+                    if np.isnan(p0) or np.isnan(p_past) or p0 <= 0 or p_past <= 0:
+                        continue
+                    ret = (p0 - p_past) / p_past
+                    pct = s_p.iloc[max(0, idx_now - 30) : idx_now + 1].pct_change().dropna()
+                    vol = float(pct.std() * np.sqrt(365.25)) if len(pct) >= 20 else 1.0
+                    if np.isnan(vol) or vol < 0.05:
+                        vol = 0.05
+                    cand.append({"sym": sym, "score": ret / vol})
 
-            # Check regular rebalance cadence
-            elif days_since_rebalance >= rebalance_days:
-                days_since_rebalance = 0
-                if not is_btc_bullish:
-                    current_coins = []
-                    target_weights = {}
-                    is_in_cash = True
+                df_c = pd.DataFrame(cand)
+                target_coins = df_c.sort_values("score", ascending=False).head(k)["sym"].tolist()
+                target_w = {s: 1.0 / len(target_coins) for s in target_coins}
+
+                # Check if emergency stop triggered mid-cycle
+                if daily_emergency_stop:
+                    cycle_days = common_idx[(common_idx > t0) & (common_idx < t1)]
+                    broke_day = None
+                    for d in cycle_days:
+                        if s_btc.loc[d] < s_btc_ema50.loc[d]:
+                            broke_day = d
+                            break
+                    if broke_day is not None:
+                        # Exited early at broke_day!
+                        rets = [(price_matrix[s].loc[broke_day] - price_matrix[s].loc[t0]) / price_matrix[s].loc[t0] for s in target_coins if broke_day in price_matrix[s].index]
+                        days_held = (broke_day - t0).days
+                        fund = 0.0001 * 3.0 * days_held
+                    else:
+                        rets = [(price_matrix[s].loc[t1] - price_matrix[s].loc[t0]) / price_matrix[s].loc[t0] for s in target_coins if t1 in price_matrix[s].index]
+                        fund = 0.0001 * 3.0 * rebalance_days
                 else:
-                    t_past_30 = common_idx[max(0, idx - 30)]
-                    btc_30d = (btc_price - s_btc.loc[t_past_30]) / s_btc.loc[t_past_30]
+                    rets = [(price_matrix[s].loc[t1] - price_matrix[s].loc[t0]) / price_matrix[s].loc[t0] for s in target_coins if t1 in price_matrix[s].index]
+                    fund = 0.0001 * 3.0 * rebalance_days
 
-                    cand = []
-                    for sym in price_matrix.columns:
-                        s_p = price_matrix[sym]
-                        p0 = s_p.loc[t_day]
-                        p_past = s_p.loc[t_past_30]
-                        if np.isnan(p0) or np.isnan(p_past) or p0 <= 0 or p_past <= 0:
-                            continue
-                        ret = (p0 - p_past) / p_past
-                        pct = s_p.iloc[max(0, idx - 30) : idx + 1].pct_change().dropna()
-                        vol = float(pct.std() * np.sqrt(365.25)) if len(pct) >= 20 else 1.0
-                        if np.isnan(vol) or vol < 0.05:
-                            vol = 0.05
-                        cand.append({"sym": sym, "score": ret / vol})
+                r_period = float(np.mean(rets)) - fund if rets else 0.0
 
-                    df_c = pd.DataFrame(cand)
-                    current_coins = df_c.sort_values("score", ascending=False).head(k)["sym"].tolist()
-                    target_weights = {s: 1.0 / len(current_coins) for s in current_coins}
-                    is_in_cash = False
-            else:
-                # Keep holding current positions
-                target_weights = curr_weights
-                days_since_rebalance += 1
-
-            # Turnover & Cost on any position changes
-            turnover = sum(abs(target_weights.get(s, 0.0) - curr_weights.get(s, 0.0)) for s in set(curr_weights).union(target_weights)) / 2.0
+            turnover = sum(abs(target_w.get(s, 0.0) - curr_w.get(s, 0.0)) for s in set(curr_w).union(target_w)) / 2.0
             fee = turnover * 2.0 * total_one_way_cost
-            funding = (0.0001 * 3.0) if not is_in_cash else 0.0
+            r_period = r_period - fee
 
-            # Forward 1-day return
-            if is_in_cash or not current_coins:
-                r_day = 0.0 - fee
-            else:
-                rets = [(price_matrix[s].loc[t_next] - price_matrix[s].loc[t_day]) / price_matrix[s].loc[t_day] for s in current_coins if t_next in price_matrix[s].index]
-                r_day = float(np.mean(rets)) - fee - funding
+            eq = eq * (1.0 + r_period)
+            cadence_records.append(r_period)
+            curr_w = target_w
 
-            eq = eq * (1.0 + r_day)
-            daily_records.append(r_day)
-            curr_weights = target_weights
-
-        r_arr = np.array(daily_records)
+        r_arr = np.array(cadence_records)
         eq_curve = 7000.0 * np.cumprod(1.0 + r_arr)
         peaks = np.maximum.accumulate(eq_curve)
         max_dd = float(np.max((peaks - eq_curve) / peaks)) * 100
 
-        # Annualized metrics
-        mean_d = np.mean(r_arr)
-        std_d = np.std(r_arr)
+        n_periods = len(r_arr)
+        periods_per_year = 365.25 / rebalance_days
+        mean_p = np.mean(r_arr)
+        std_p = np.std(r_arr)
         downside_std = np.std(r_arr[r_arr < 0]) if np.sum(r_arr < 0) > 0 else 1e-6
-        sharpe = (mean_d / std_d * np.sqrt(365.25)) if std_d > 1e-6 else 0.0
-        sortino = (mean_d / downside_std * np.sqrt(365.25)) if downside_std > 1e-6 else 0.0
+        sharpe = (mean_p / std_p * np.sqrt(periods_per_year)) if std_p > 1e-6 else 0.0
+        sortino = (mean_p / downside_std * np.sqrt(periods_per_year)) if downside_std > 1e-6 else 0.0
 
         final_bal = eq
         tot_ret = (final_bal - 7000.0) / 7000.0 * 100
