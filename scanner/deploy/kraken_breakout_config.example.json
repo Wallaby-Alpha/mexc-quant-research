@@ -5,6 +5,15 @@
   "total_exposure_pct": 15.0,
   "top_k": 10,
   "lookback_days": 20,
-  "min_24h_volume_usd": 100000.0,
-  "daily_loss_circuit_breaker_pct": 2.2
+  "daily_loss_circuit_breaker_pct": 2.2,
+  "allowed_coins": [
+    "BCH", "LIGHTER", "MON", "STX", "ETHFI", "JTO", "PEPE", "ENA", "WIF",
+    "SUI", "NEAR", "GRASS", "UNI", "AAVE", "ADA", "AIXBT", "ALGO", "APT",
+    "ARB", "ASTER", "ATOM", "AVAX", "BNB", "BONK", "CRV", "DOGE", "DOT",
+    "ETC", "ETH", "FARTCOIN", "FIL", "FLOKI", "HBAR", "HYPE", "ICP",
+    "INJ", "JUP", "KAITO", "LDO", "LINK", "LTC", "MOODENG", "ONDO", "OP",
+    "PENDLE", "PENGU", "PNUT", "POL", "POPCAT", "PUMP", "RENDER", "S",
+    "SHIB", "SOL", "TAO", "TIA", "TRUMP", "TRX", "VIRTUAL", "WLD", "XLM",
+    "XPL", "XRP", "ZEC", "ZRO"
+  ]
 }

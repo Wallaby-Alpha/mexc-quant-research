@@ -2,9 +2,9 @@
 scanner/kraken_breakout_scanner.py
 Production-ready scanner for the Breakout Prop Firm / Kraken Futures Rotational Momentum Strategy.
 Runs weekly (every Monday at 00:01 UTC) or on-demand:
-1. Fetches live Kraken Futures perpetual contracts (200+ markets).
-2. Calculates BTC macro trend (50-day EMA) using PF_XBTUSD daily candles.
-3. Ranks Kraken altcoin perpetuals by 20-day momentum.
+1. Restricts asset universe strictly to the user-specified Breakout tradeable coins (65 assets).
+2. Calculates BTC macro trend (50-day EMA) using PF_XBTUSD daily candles on Kraken.
+3. Ranks Breakout altcoins by 20-day relative strength / momentum.
 4. Selects the Top 10 coins and sizes them conservatively (15% total exposure / 1.5% per coin)
    to strictly respect Breakout Prop Firm limits (3.0% max daily loss, 5.0% / 6.0% max drawdown).
 5. Dispatches formatted, actionable signals (BUY / SELL / HOLD) to a dedicated Telegram bot.
@@ -45,6 +45,18 @@ KRAKEN_FUTURES_CHART_URL = "https://futures.kraken.com/api/charts/v1/trade/{symb
 STATE_FILE = Path("kraken_breakout_state.json")
 CONFIG_FILE = Path("kraken_breakout_config.json")
 
+# Verified Breakout Supported Coin Universe
+DEFAULT_BREAKOUT_UNIVERSE = [
+    "BCH", "LIGHTER", "MON", "STX", "ETHFI", "JTO", "PEPE", "ENA", "WIF",
+    "SUI", "NEAR", "GRASS", "UNI", "AAVE", "ADA", "AIXBT", "ALGO", "APT",
+    "ARB", "ASTER", "ATOM", "AVAX", "BNB", "BONK", "CRV", "DOGE", "DOT",
+    "ETC", "ETH", "FARTCOIN", "FIL", "FLOKI", "HBAR", "HYPE", "ICP",
+    "INJ", "JUP", "KAITO", "LDO", "LINK", "LTC", "MOODENG", "ONDO", "OP",
+    "PENDLE", "PENGU", "PNUT", "POL", "POPCAT", "PUMP", "RENDER", "S",
+    "SHIB", "SOL", "TAO", "TIA", "TRUMP", "TRX", "VIRTUAL", "WLD", "XLM",
+    "XPL", "XRP", "ZEC", "ZRO"
+]
+
 
 def load_config() -> Dict[str, Any]:
     """Loads Breakout Kraken scanner configuration and credentials."""
@@ -55,8 +67,8 @@ def load_config() -> Dict[str, Any]:
         "total_exposure_pct": float(os.environ.get("BREAKOUT_EXPOSURE_PCT", "15.0")),  # 15% total account exposure
         "top_k": int(os.environ.get("BREAKOUT_TOP_K", "10")),
         "lookback_days": int(os.environ.get("BREAKOUT_LOOKBACK_DAYS", "20")),
-        "min_24h_volume_usd": float(os.environ.get("BREAKOUT_MIN_VOLUME_USD", "100000.0")),
         "daily_loss_circuit_breaker_pct": 2.2,  # Alert user if daily portfolio loss reaches -2.2%
+        "allowed_coins": DEFAULT_BREAKOUT_UNIVERSE
     }
     if CONFIG_FILE.exists():
         try:
@@ -97,40 +109,6 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
                 logger.error(f"Telegram network error: {e}")
                 time.sleep(2)
     return True
-
-
-def fetch_kraken_perpetual_tickers(min_volume_usd: float = 100000.0) -> List[Dict[str, Any]]:
-    """Fetches active perpetual futures contracts from Kraken with adequate 24h liquidity."""
-    try:
-        resp = requests.get(KRAKEN_FUTURES_TICKERS_URL, timeout=12)
-        if resp.status_code != 200:
-            logger.error(f"Failed to fetch Kraken tickers: status {resp.status_code}")
-            return []
-        
-        tickers = resp.json().get("tickers", [])
-        liquid_perps = []
-        for t in tickers:
-            if t.get("tag") != "perpetual":
-                continue
-            symbol = t.get("symbol", "")
-            if not symbol or symbol == "PF_XBTUSD":
-                continue
-            
-            vol_quote = float(t.get("volumeQuote") or 0.0)
-            if vol_quote >= min_volume_usd and not t.get("suspended", False):
-                liquid_perps.append({
-                    "symbol": symbol,
-                    "pair": t.get("pair", ""),
-                    "mark_price": float(t.get("markPrice") or 0.0),
-                    "volume_quote": vol_quote,
-                    "change_24h": float(t.get("change24h") or 0.0)
-                })
-        
-        logger.info(f"Retrieved {len(liquid_perps)} liquid perpetual contracts from Kraken Futures.")
-        return liquid_perps
-    except Exception as e:
-        logger.error(f"Error querying Kraken tickers: {e}")
-        return []
 
 
 def fetch_kraken_daily_candles(symbol: str) -> Optional[pd.DataFrame]:
@@ -180,19 +158,51 @@ def evaluate_btc_macro_regime() -> Tuple[bool, float, float, float]:
     return is_bullish, btc_close, btc_ema50, dist_pct
 
 
-def rank_kraken_altcoin_momentum(perps: List[Dict[str, Any]], lookback_days: int = 20) -> List[Dict[str, Any]]:
-    """Fetches daily candles for liquid altcoin perps and ranks them by lookback momentum."""
-    ranked = []
-    total = len(perps)
-    logger.info(f"Calculating {lookback_days}-day momentum across {total} Kraken markets...")
+def map_breakout_universe_to_kraken(allowed_coins: List[str]) -> Tuple[Dict[str, str], List[str]]:
+    """Maps the specified Breakout coins to their corresponding Kraken Futures symbols."""
+    try:
+        resp = requests.get(KRAKEN_FUTURES_TICKERS_URL, timeout=12)
+        if resp.status_code != 200:
+            logger.error("Failed to query Kraken tickers.")
+            return {}, allowed_coins
+        
+        tickers = resp.json().get("tickers", [])
+        active_symbols = {t["symbol"]: t for t in tickers if not t.get("suspended", False)}
 
-    for idx, p in enumerate(perps):
-        sym = p["symbol"]
+        symbol_map = {}
+        missing = []
+
+        cleaned_coins = sorted(list(set(c.strip().upper() for c in allowed_coins if c.strip())))
+
+        for coin in cleaned_coins:
+            direct_pf = f"PF_{coin}USD"
+            direct_pi = f"PI_{coin}USD"
+            
+            if direct_pf in active_symbols:
+                symbol_map[coin] = direct_pf
+            elif direct_pi in active_symbols:
+                symbol_map[coin] = direct_pi
+            else:
+                missing.append(coin)
+
+        return symbol_map, missing
+    except Exception as e:
+        logger.error(f"Error mapping Breakout universe to Kraken: {e}")
+        return {}, allowed_coins
+
+
+def rank_breakout_universe_momentum(symbol_map: Dict[str, str], lookback_days: int = 20) -> List[Dict[str, Any]]:
+    """Calculates relative strength / momentum strictly for the Breakout allowed coins."""
+    ranked = []
+    total = len(symbol_map)
+    logger.info(f"Scanning {total} Breakout coins on Kraken for {lookback_days}-day Relative Strength...")
+
+    for coin, sym in symbol_map.items():
         df = fetch_kraken_daily_candles(sym)
         if df is None or len(df) <= lookback_days + 1:
             continue
         
-        # Closed candles only
+        # Exclude in-progress candle
         closed = df.iloc[:-1]
         c_now = closed.iloc[-1]["close"]
         c_past = closed.iloc[-lookback_days]["close"]
@@ -201,23 +211,17 @@ def rank_kraken_altcoin_momentum(perps: List[Dict[str, Any]], lookback_days: int
             continue
         
         ret_pct = ((c_now - c_past) / c_past) * 100.0
-        
-        # Clean clean base symbol: PF_SOLUSD -> SOL
-        base_name = sym.replace("PF_", "").replace("USD", "").replace("USDT", "")
-        
+
         ranked.append({
+            "base": coin,
             "symbol": sym,
-            "base": base_name,
-            "pair": p["pair"],
-            "mark_price": p["mark_price"],
-            "momentum_pct": ret_pct,
-            "volume_quote": p["volume_quote"],
-            "change_24h": p["change_24h"]
+            "mark_price": c_now,
+            "momentum_pct": ret_pct
         })
-        time.sleep(0.05)  # Politeness delay to prevent rate limits
+        time.sleep(0.04)  # Politeness delay
 
     ranked.sort(key=lambda x: x["momentum_pct"], reverse=True)
-    logger.info(f"Successfully ranked {len(ranked)} altcoins on Kraken.")
+    logger.info(f"Successfully ranked {len(ranked)} active Breakout assets.")
     return ranked
 
 
@@ -243,7 +247,7 @@ def save_state(state: Dict[str, Any]) -> None:
 
 
 def run_scanner(dry_run: bool = False, force: bool = False) -> None:
-    """Executes the full Breakout Kraken weekly rotation scan and alerts."""
+    """Executes the Breakout weekly rotation scan restricted strictly to the user's coin universe."""
     config = load_config()
     token = config["telegram_bot_token"]
     chat_id = config["telegram_chat_id"]
@@ -251,8 +255,8 @@ def run_scanner(dry_run: bool = False, force: bool = False) -> None:
     total_exposure_pct = config["total_exposure_pct"]
     top_k = config["top_k"]
     lookback = config["lookback_days"]
-    min_vol = config["min_24h_volume_usd"]
     circuit_breaker = config["daily_loss_circuit_breaker_pct"]
+    allowed_coins = config.get("allowed_coins", DEFAULT_BREAKOUT_UNIVERSE)
 
     # Sizing calculations for Breakout Prop Firm Rules
     total_capital_deployed = account_size * (total_exposure_pct / 100.0)
@@ -262,7 +266,7 @@ def run_scanner(dry_run: bool = False, force: bool = False) -> None:
     cash_pct = 100.0 - total_exposure_pct
 
     now_utc = pd.Timestamp.now(tz="UTC")
-    logger.info(f"Running Breakout Kraken Scanner at {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    logger.info(f"Running Breakout Scanner for {len(allowed_coins)} specified coins at {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
     # Check BTC Macro Regime
     is_bullish, btc_close, btc_ema50, dist_pct = evaluate_btc_macro_regime()
@@ -294,7 +298,7 @@ def run_scanner(dry_run: bool = False, force: bool = False) -> None:
             f"{sells_txt}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"💼 <b>Portfolio State:</b> 100% Cash Margin ($0 allocated)\n"
-            f"🎯 <b>Objective:</b> Preserve Drawdown Limit (6% Classic / 5% Pro)"
+            f"🎯 <b>Objective:</b> Strictly protect Breakout drawdown limit (6% Classic / 5% Pro)"
         )
         print("\n" + msg + "\n")
         if not dry_run:
@@ -306,13 +310,16 @@ def run_scanner(dry_run: bool = False, force: bool = False) -> None:
             })
         return
 
-    # BULLISH REGIME: Fetch and rank liquid Kraken perpetuals
-    perps = fetch_kraken_perpetual_tickers(min_volume_usd=min_vol)
-    if not perps:
-        logger.error("No liquid perpetuals found on Kraken.")
+    # Map allowed Breakout coins to Kraken
+    symbol_map, missing_coins = map_breakout_universe_to_kraken(allowed_coins)
+    logger.info(f"Active tradeable coins on Kraken: {len(symbol_map)} / {len(allowed_coins)}")
+
+    # Rank by 20-day momentum
+    ranked = rank_breakout_universe_momentum(symbol_map, lookback_days=lookback)
+    if not ranked:
+        logger.error("No valid candidate coins could be ranked.")
         return
 
-    ranked = rank_kraken_altcoin_momentum(perps, lookback_days=lookback)
     selected_10 = ranked[:top_k]
     new_symbols = [c["symbol"] for c in selected_10]
 
@@ -323,14 +330,14 @@ def run_scanner(dry_run: bool = False, force: bool = False) -> None:
 
     # Build Telegram Message
     buys_txt = "\n".join([
-        f"  🟢 <b>BUY:</b> <code>{c['symbol']}</code> ({c['base']})\n"
-        f"     • Momentum ({lookback}d): <b>{c['momentum_pct']:+.1f}%</b> | Price: <code>${c['mark_price']:.4f}</code>\n"
-        f"     • Sizing: <b>${capital_per_coin:,.0f}</b> ({pct_per_coin:.1f}% of account)"
+        f"  🟢 <b>BUY:</b> <code>{c['symbol']}</code> (<b>{c['base']}</b>)\n"
+        f"     • 20d Rel. Strength: <b>{c['momentum_pct']:+.1f}%</b> | Price: <code>${c['mark_price']:,.4f}</code>\n"
+        f"     • Position Size: <b>${capital_per_coin:,.0f}</b> ({pct_per_coin:.1f}% of account)"
         for c in buys
     ]) if buys else "  ⚪ None (Portfolio fully aligned)"
 
     holds_txt = "\n".join([
-        f"  🔵 <b>HOLD:</b> <code>{c['symbol']}</code> ({c['base']}) | Momentum: <b>{c['momentum_pct']:+.1f}%</b>"
+        f"  🔵 <b>HOLD:</b> <code>{c['symbol']}</code> (<b>{c['base']}</b>) | Rel. Strength: <b>{c['momentum_pct']:+.1f}%</b>"
         for c in holds
     ]) if holds else "  ⚪ None"
 
@@ -340,19 +347,19 @@ def run_scanner(dry_run: bool = False, force: bool = False) -> None:
     ]) if sells else "  ⚪ None"
 
     msg = (
-        f"🏦 <b>BREAKOUT PROP TRADING: WEEKLY ROTATION REBALANCE</b>\n"
+        f"🏦 <b>BREAKOUT PROP TRADING: RELATIVE STRENGTH ROTATION</b>\n"
         f"📅 <i>{now_utc.strftime('%A, %b %d, %Y - %H:%M UTC')}</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📈 <b>Macro BTC Regime:</b> 🟢 <b>BULLISH</b>\n"
         f"• BTC Close: <code>${btc_close:,.2f}</code> | 50 EMA: <code>${btc_ema50:,.2f}</code> (<b>{dist_pct:+.2f}%</b>)\n\n"
         f"🛡️ <b>BREAKOUT SIZING & RISK RULES ({total_exposure_pct:.0f}% Total Exposure):</b>\n"
         f"• Account Balance: <code>${account_size:,.0f}</code>\n"
-        f"• Deployed Capital: <b>${total_capital_deployed:,.0f}</b> ({total_exposure_pct:.0f}% across {top_k} coins)\n"
-        f"• Per Coin Position: <b>${capital_per_coin:,.0f}</b> ({pct_per_coin:.1f}% each)\n"
-        f"• Idle Cash Margin: <b>${cash_reserved:,.0f}</b> ({cash_pct:.0f}% safe buffer)\n"
-        f"• ⚠️ <b>Daily Hard Stop:</b> Close all if daily loss hits <b>-{circuit_breaker:.1f}%</b> (safeguards 3.0% daily cap)\n"
+        f"• Total Exposure: <b>${total_capital_deployed:,.0f}</b> ({total_exposure_pct:.0f}% across {top_k} coins)\n"
+        f"• Size per Coin: <b>${capital_per_coin:,.0f}</b> ({pct_per_coin:.1f}% each)\n"
+        f"• Cash Margin Buffer: <b>${cash_reserved:,.0f}</b> ({cash_pct:.0f}% safe buffer)\n"
+        f"• ⚠️ <b>Hard Daily Stop:</b> Close all if daily loss hits <b>-{circuit_breaker:.1f}%</b> (safeguards 3.0% daily cap)\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 <b>REBALANCE INSTRUCTIONS:</b>\n\n"
+        f"📋 <b>REBALANCE INSTRUCTIONS (Breakout Universe):</b>\n\n"
         f"<b>1. NEW ORDERS TO OPEN ({len(buys)}):</b>\n"
         f"{buys_txt}\n\n"
         f"<b>2. EXISTING POSITIONS TO HOLD ({len(holds)}):</b>\n"
@@ -360,7 +367,7 @@ def run_scanner(dry_run: bool = False, force: bool = False) -> None:
         f"<b>3. POSITIONS TO CLOSE ({len(sells)}):</b>\n"
         f"{sells_txt}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 <b>Target:</b> +10% Classic / +12% Pro Evaluation (Zero Time Limit)"
+        f"🎯 <b>Evaluation Target:</b> +10% Classic / +12% Pro (No Time Limit)"
     )
 
     print("\n" + msg + "\n")
@@ -385,7 +392,8 @@ def test_telegram_connection() -> None:
     
     test_msg = (
         "🤖 <b>Breakout Prop Trading Bot Connected!</b>\n\n"
-        "Your dedicated Telegram alert channel for Kraken Futures Weekly Momentum is operational.\n"
+        "Your dedicated Telegram alert channel for Breakout Relative Strength Rotation is active.\n"
+        "Universe: 65 Breakout supported coins.\n"
         "Rebalances will trigger every <b>Monday at 00:01 UTC</b>."
     )
     print(f"Sending test notification to Chat ID: {chat_id}...")
@@ -397,7 +405,7 @@ def test_telegram_connection() -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Breakout Prop Firm Kraken Weekly Rotation Scanner")
+    parser = argparse.ArgumentParser(description="Breakout Prop Firm Relative Strength Weekly Rotation Scanner")
     parser.add_argument("--dry-run", action="store_true", help="Run scan and print results to terminal without sending Telegram or saving state.")
     parser.add_argument("--force-scan", action="store_true", help="Force immediate execution regardless of weekday.")
     parser.add_argument("--test-telegram", action="store_true", help="Send a test message to verify Telegram credentials.")
