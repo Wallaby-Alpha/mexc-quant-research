@@ -271,16 +271,21 @@ def run_scanner(dry_run: bool = False, force: bool = False) -> None:
     # Check BTC Macro Regime
     is_bullish, btc_close, btc_ema50, dist_pct = evaluate_btc_macro_regime()
 
-    # Load Previous State
+    # Load Previous State (sanitizing to strictly allowed Breakout coins)
     old_state = load_state()
-    old_symbols = [h["symbol"] for h in old_state.get("current_holdings", [])]
+    allowed_bases = set(c.strip().upper() for c in allowed_coins if c.strip())
+    clean_old_holdings = [
+        h for h in old_state.get("current_holdings", [])
+        if h.get("base", "").upper() in allowed_bases
+    ]
+    old_symbols = [h["symbol"] for h in clean_old_holdings]
 
     if not is_bullish:
         # BEARISH REGIME: Switch to 100% Cash Margin
         logger.info("Macro regime is BEARISH (BTC < 50-day EMA). Strategy mandates 100% CASH.")
         
         sell_orders = []
-        for h in old_state.get("current_holdings", []):
+        for h in clean_old_holdings:
             sell_orders.append(f"  🔴 <b>CLOSE/SELL:</b> {h['symbol']} ({h['base']})")
         
         sells_txt = "\n".join(sell_orders) if sell_orders else "  ⚪ No open positions were held."
@@ -321,6 +326,8 @@ def run_scanner(dry_run: bool = False, force: bool = False) -> None:
         return
 
     selected_10 = ranked[:top_k]
+    # Strict universe guard: ensure 100% of selected coins are within the allowed list
+    selected_10 = [c for c in selected_10 if c["base"].upper() in allowed_bases]
     new_symbols = [c["symbol"] for c in selected_10]
 
     # Rebalance Diff: BUYS, HOLDS, SELLS
@@ -350,6 +357,7 @@ def run_scanner(dry_run: bool = False, force: bool = False) -> None:
         f"🏦 <b>BREAKOUT PROP TRADING: RELATIVE STRENGTH ROTATION</b>\n"
         f"📅 <i>{now_utc.strftime('%A, %b %d, %Y - %H:%M UTC')}</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>Universe:</b> 65 Breakout Whitelisted Coins (Top {top_k} Selected)\n"
         f"📈 <b>Macro BTC Regime:</b> 🟢 <b>BULLISH</b>\n"
         f"• BTC Close: <code>${btc_close:,.2f}</code> | 50 EMA: <code>${btc_ema50:,.2f}</code> (<b>{dist_pct:+.2f}%</b>)\n\n"
         f"🛡️ <b>BREAKOUT SIZING & RISK RULES ({total_exposure_pct:.0f}% Total Exposure):</b>\n"
@@ -409,9 +417,16 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="Run scan and print results to terminal without sending Telegram or saving state.")
     parser.add_argument("--force-scan", action="store_true", help="Force immediate execution regardless of weekday.")
     parser.add_argument("--test-telegram", action="store_true", help="Send a test message to verify Telegram credentials.")
+    parser.add_argument("--reset-state", action="store_true", help="Wipe saved state file to start fresh without legacy holdings.")
     args = parser.parse_args()
 
-    if args.test_telegram:
+    if args.reset_state:
+        if STATE_FILE.exists():
+            STATE_FILE.unlink()
+            print("✅ Successfully cleared kraken_breakout_state.json. State reset to empty.")
+        else:
+            print("ℹ️ State file kraken_breakout_state.json was already empty.")
+    elif args.test_telegram:
         test_telegram_connection()
     else:
         run_scanner(dry_run=args.dry_run, force=args.force_scan)
