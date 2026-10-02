@@ -176,29 +176,52 @@ def load_config() -> Dict[str, Any]:
 
 
 def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
-    """Dispatches formatted message to Telegram Bot."""
+    """Dispatches formatted message to Telegram Bot, auto-chunking if length > 3800."""
     if not token or not chat_id:
         logger.warning("Telegram token or chat_id not configured. Printing message to stdout only.")
         return False
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=12)
-        if resp.status_code == 200:
-            logger.info("Successfully sent Telegram alert.")
-            return True
-        else:
-            logger.error(f"Telegram API error {resp.status_code}: {resp.text}")
-            return False
-    except Exception as e:
-        logger.error(f"Failed to send Telegram message: {e}")
-        return False
+    
+    # Split text if it exceeds Telegram's 4096 character limit
+    max_len = 3800
+    chunks = []
+    if len(text) <= max_len:
+        chunks = [text]
+    else:
+        current_chunk = ""
+        for line in text.split("\n"):
+            if len(current_chunk) + len(line) + 1 > max_len:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = line + "\n"
+            else:
+                current_chunk += line + "\n"
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+
+    success = True
+    for i, chunk in enumerate(chunks):
+        payload = {
+            "chat_id": chat_id,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=12)
+            if resp.status_code == 200:
+                logger.info(f"Successfully sent Telegram alert part {i+1}/{len(chunks)}.")
+            else:
+                logger.error(f"Telegram API error {resp.status_code}: {resp.text}")
+                success = False
+        except Exception as e:
+            logger.error(f"Failed to send Telegram message: {e}")
+            success = False
+        if len(chunks) > 1 and i < len(chunks) - 1:
+            time.sleep(0.5)
+
+    return success
 
 
 def get_mexc_klines(symbol: str, interval: str = "1d", limit: int = 100) -> pd.DataFrame:
@@ -535,39 +558,49 @@ def run_scanner():
         ch = coin_chains.get(s, "Unknown")
         msg += f" {i}. <code>{s:<10s}</code> [{ch:<10s}] +{row['alt_return_30d']*100:5.1f}% | RS: {row['rs_spread_vs_btc']*100:+5.1f}%\n"
 
-    # Reserve Alternates Section (Next in line)
-    msg += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "🔄 <b>RESERVE ALTERNATES (NEXT IN LINE TO BUY):</b>\n"
-    msg += "<i>Use these replacements if you cannot or prefer not to buy any of the top picks:</i>\n\n"
-    msg += "<b>Quality Alternates (Ranks #8 to #15):</b>\n"
+    # Part 2: Reserves and Depth Leaderboards
+    msg_reserves = (
+        f"🔄 <b>RESERVE ALTERNATES & DEPTH LEADERBOARDS</b>\n"
+        f"📅 <i>{now_utc}</i>\n\n"
+        f"<i>Use these replacements if you cannot or prefer not to buy any of the top picks:</i>\n\n"
+        f"<b>Quality Alternates (Ranks #8 to #15):</b>\n"
+    )
     for _, row in df_quality.iloc[7:15].iterrows():
         s = row["symbol"]
         ch = resolve_chain(s, exchange_info)
-        msg += f"• <code>{s:<10s}</code> [{ch:<10s}] #Q{row['rank_quality']:2d} | +{row['alt_return_30d']*100:5.1f}% (Sharpe: {row['sharpe_score']:4.2f})\n"
+        msg_reserves += f"• <code>{s:<10s}</code> [{ch:<10s}] #Q{row['rank_quality']:2d} | +{row['alt_return_30d']*100:5.1f}% (Sharpe: {row['sharpe_score']:4.2f})\n"
 
-    msg += "\n<b>Raw Momentum Alternates (Next In Line):</b>\n"
+    msg_reserves += "\n<b>Raw Momentum Alternates (Next In Line):</b>\n"
     raw_reserves = df_raw_filtered.iloc[3:10]
     for _, row in raw_reserves.iterrows():
         s = row["symbol"]
         ch = resolve_chain(s, exchange_info)
-        msg += f"• <code>{s:<10s}</code> [{ch:<10s}] #R{row['rank_raw']:2d} | +{row['alt_return_30d']*100:5.1f}% (RS: {row['rs_spread_vs_btc']*100:+5.1f}%)\n"
+        msg_reserves += f"• <code>{s:<10s}</code> [{ch:<10s}] #R{row['rank_raw']:2d} | +{row['alt_return_30d']*100:5.1f}% (RS: {row['rs_spread_vs_btc']*100:+5.1f}%)\n"
 
-    msg += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "📊 <b>TOP 15 QUALITY LEADERBOARD:</b>\n"
+    msg_reserves += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg_reserves += "📊 <b>TOP 15 QUALITY LEADERBOARD:</b>\n"
     for _, row in df_quality.head(15).iterrows():
         s = row["symbol"]
         ch = resolve_chain(s, exchange_info)
-        msg += f"<b>#Q{row['rank_quality']:2d}</b> <code>{s:<10s}</code> [{ch:<10s}]: {row['alt_return_30d']*100:+5.1f}% (Sharpe: {row['sharpe_score']:4.2f})\n"
+        msg_reserves += f"<b>#Q{row['rank_quality']:2d}</b> <code>{s:<10s}</code> [{ch:<10s}]: {row['alt_return_30d']*100:+5.1f}% (Sharpe: {row['sharpe_score']:4.2f})\n"
 
-    msg += "\n📊 <b>TOP 15 RAW LEADERBOARD:</b>\n"
+    msg_reserves += "\n📊 <b>TOP 15 RAW LEADERBOARD:</b>\n"
     for _, row in df_raw.head(15).iterrows():
         s = row["symbol"]
         ch = resolve_chain(s, exchange_info)
-        msg += f"<b>#R{row['rank_raw']:2d}</b> <code>{s:<10s}</code> [{ch:<10s}]: {row['alt_return_30d']*100:+5.1f}% (RS: {row['rs_spread_vs_btc']*100:+5.1f}%)\n"
+        msg_reserves += f"<b>#R{row['rank_raw']:2d}</b> <code>{s:<10s}</code> [{ch:<10s}]: {row['alt_return_30d']*100:+5.1f}% (RS: {row['rs_spread_vs_btc']*100:+5.1f}%)\n"
 
+    print("=" * 60)
     print(msg)
+    print("=" * 60)
+    print(msg_reserves)
+
     save_portfolio_state(final_quality_holdings, final_raw_holdings)
+
+    # Dispatch Part 1 (Main Action Orders) and Part 2 (Reserves/Leaderboards)
     send_telegram_message(cfg["telegram_bot_token"], cfg["telegram_chat_id"], msg)
+    time.sleep(1.0)
+    send_telegram_message(cfg["telegram_bot_token"], cfg["telegram_chat_id"], msg_reserves)
 
 
 if __name__ == "__main__":
