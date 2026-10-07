@@ -37,9 +37,27 @@ logging.basicConfig(
 logger = logging.getLogger("daily_rotation_scanner")
 
 MEXC_BASE_URL = "https://api.mexc.com"
-STATE_FILE = Path("portfolio_state_daily.json")
-CONFIG_FILE = Path("daily_scanner_config.json")
-FALLBACK_CONFIG_FILE = Path("scanner_config.json")
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+def get_config_file() -> Optional[Path]:
+    candidates = [
+        Path("daily_scanner_config.json"),
+        SCRIPT_DIR / "daily_scanner_config.json",
+        Path("scanner_config.json"),
+        SCRIPT_DIR / "scanner_config.json",
+        SCRIPT_DIR / "deploy" / "daily_scanner_config.example.json",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+def get_state_file() -> Path:
+    if Path("portfolio_state_daily.json").exists():
+        return Path("portfolio_state_daily.json")
+    if (SCRIPT_DIR / "portfolio_state_daily.json").exists():
+        return SCRIPT_DIR / "portfolio_state_daily.json"
+    return Path("portfolio_state_daily.json")
 
 # Known Native Layer 1s / Layer 2s
 NATIVE_L1_CHAINS = {
@@ -167,13 +185,14 @@ def load_config() -> Dict[str, Any]:
         "min_volume_24h_usdt": float(os.environ.get("MIN_VOLUME_USDT", "500000.0")),
     }
     
-    # Try daily config first, fallback to standard scanner config
-    cfg_to_read = CONFIG_FILE if CONFIG_FILE.exists() else (FALLBACK_CONFIG_FILE if FALLBACK_CONFIG_FILE.exists() else None)
+    # Try loading config from resolved candidate paths
+    cfg_to_read = get_config_file()
     if cfg_to_read:
         try:
             with open(cfg_to_read, "r", encoding="utf-8") as f:
                 file_cfg = json.load(f)
                 config.update(file_cfg)
+                logger.info(f"Loaded config from {cfg_to_read}")
         except Exception as e:
             logger.warning(f"Failed to read {cfg_to_read}: {e}")
 
@@ -304,12 +323,13 @@ def check_btc_macro_trend() -> Tuple[bool, float, float]:
 
 def load_portfolio_state() -> Dict[str, Any]:
     """Loads currently held symbols from daily state file."""
-    if STATE_FILE.exists():
+    state_file = get_state_file()
+    if state_file.exists():
         try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
+            with open(state_file, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            logger.warning(f"Could not load daily state file: {e}")
+            logger.warning(f"Could not load daily state file {state_file}: {e}")
     return {"current_quality_holdings": [], "current_raw_holdings": []}
 
 
@@ -323,7 +343,8 @@ def save_portfolio_state(quality_holdings: List[str], raw_holdings: List[str]):
         "current_raw_holdings": raw_holdings,
         "total_active_holdings": quality_holdings + raw_holdings
     }
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    state_file = get_state_file()
+    with open(state_file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 
