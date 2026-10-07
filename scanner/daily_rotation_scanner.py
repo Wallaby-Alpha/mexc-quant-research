@@ -153,6 +153,17 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
 # -----------------------------------------------------------------------------
 # KRAKEN FUTURES API METHODS
 # -----------------------------------------------------------------------------
+def get_kraken_live_tickers() -> Dict[str, Dict[str, Any]]:
+    """Fetches real-time live tickers from Kraken Futures."""
+    try:
+        resp = requests.get(KRAKEN_FUTURES_TICKERS_URL, timeout=12)
+        tickers = resp.json().get("tickers", [])
+        return {t["symbol"]: t for t in tickers if not t.get("suspended", False)}
+    except Exception as e:
+        logger.error(f"Error querying Kraken tickers: {e}")
+        return {}
+
+
 def fetch_kraken_daily_candles(symbol: str) -> Optional[pd.DataFrame]:
     """Fetches historical daily candles from Kraken Futures."""
     url = KRAKEN_FUTURES_CHART_URL.format(symbol=symbol)
@@ -175,77 +186,77 @@ def fetch_kraken_daily_candles(symbol: str) -> Optional[pd.DataFrame]:
     return None
 
 
-def evaluate_kraken_btc_macro() -> Tuple[bool, float, float, float]:
-    """Checks BTC 50-day EMA on Kraken Futures PF_XBTUSD."""
+def evaluate_kraken_btc_macro(live_tickers: Dict[str, Dict[str, Any]]) -> Tuple[bool, float, float, float]:
+    """Checks BTC live price against 50-day EMA on Kraken Futures PF_XBTUSD."""
     df_btc = fetch_kraken_daily_candles("PF_XBTUSD")
     if df_btc is None or len(df_btc) < 55:
         logger.error("Insufficient PF_XBTUSD candle data.")
         return False, 0.0, 0.0, 0.0
 
-    closed = df_btc.iloc[:-1].copy()
-    closed["ema50"] = closed["close"].ewm(span=50, adjust=False).mean()
-    latest = closed.iloc[-1]
-    btc_close = float(latest["close"])
-    btc_ema50 = float(latest["ema50"])
-    dist_pct = ((btc_close - btc_ema50) / btc_ema50) * 100.0
-    is_bullish = btc_close >= btc_ema50
-    return is_bullish, btc_close, btc_ema50, dist_pct
+    df_btc["ema50"] = df_btc["close"].ewm(span=50, adjust=False).mean()
+    btc_ema50 = float(df_btc["ema50"].iloc[-1])
+
+    # Use real-time live markPrice if available from tickers
+    if "PF_XBTUSD" in live_tickers:
+        btc_price = float(live_tickers["PF_XBTUSD"].get("markPrice", df_btc["close"].iloc[-1]))
+    else:
+        btc_price = float(df_btc["close"].iloc[-1])
+
+    dist_pct = ((btc_price - btc_ema50) / btc_ema50) * 100.0
+    is_bullish = btc_price >= btc_ema50
+    return is_bullish, btc_price, btc_ema50, dist_pct
 
 
-def map_breakout_coins_to_kraken(coins: List[str]) -> Tuple[Dict[str, str], List[str]]:
+def map_breakout_coins_to_kraken(coins: List[str], live_tickers: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, str], List[str]]:
     """Maps allowed Breakout coins to active Kraken perpetual futures tickers."""
-    try:
-        resp = requests.get(KRAKEN_FUTURES_TICKERS_URL, timeout=12)
-        tickers = resp.json().get("tickers", [])
-        active = {t["symbol"]: t for t in tickers if not t.get("suspended", False)}
-
-        sym_map = {}
-        missing = []
-        for c in coins:
-            c_clean = c.strip().upper()
-            if f"PF_{c_clean}USD" in active:
-                sym_map[c_clean] = f"PF_{c_clean}USD"
-            elif f"PI_{c_clean}USD" in active:
-                sym_map[c_clean] = f"PI_{c_clean}USD"
-            else:
-                missing.append(c_clean)
-        return sym_map, missing
-    except Exception as e:
-        logger.error(f"Error querying Kraken tickers: {e}")
-        return {}, coins
+    sym_map = {}
+    missing = []
+    for c in coins:
+        c_clean = c.strip().upper()
+        if f"PF_{c_clean}USD" in live_tickers:
+            sym_map[c_clean] = f"PF_{c_clean}USD"
+        elif f"PI_{c_clean}USD" in live_tickers:
+            sym_map[c_clean] = f"PI_{c_clean}USD"
+        else:
+            missing.append(c_clean)
+    return sym_map, missing
 
 
-def scan_kraken_universe(symbol_map: Dict[str, str], lookback_days: int = 7) -> List[Dict[str, Any]]:
-    """Scores Kraken Breakout coins by trailing 7-day Sharpe Momentum and Relative Strength."""
-    # First get BTC 7d return
+def scan_kraken_universe(symbol_map: Dict[str, str], live_tickers: Dict[str, Dict[str, Any]], lookback_days: int = 7) -> List[Dict[str, Any]]:
+    """Scores Kraken Breakout coins using real-time markPrice for trailing 7-day Sharpe Momentum and Relative Strength."""
+    # First get BTC 7d return using live markPrice
+    btc_p = float(live_tickers.get("PF_XBTUSD", {}).get("markPrice", 0.0))
     df_btc = fetch_kraken_daily_candles("PF_XBTUSD")
     if df_btc is not None and len(df_btc) > lookback_days + 1:
-        closed_btc = df_btc.iloc[:-1]
-        btc_now = closed_btc.iloc[-1]["close"]
-        btc_past = closed_btc.iloc[-lookback_days - 1]["close"]
-        btc_7d_ret = (btc_now - btc_past) / btc_past
+        btc_past = float(df_btc["close"].iloc[-lookback_days - 1])
+        btc_7d_ret = (btc_p - btc_past) / btc_past if btc_past > 0 and btc_p > 0 else 0.0
     else:
         btc_7d_ret = 0.0
 
     scored = []
-    logger.info(f"Scanning {len(symbol_map)} Breakout coins on Kraken for {lookback_days}-day Sharpe & RS...")
+    logger.info(f"Scanning {len(symbol_map)} Breakout coins on Kraken for {lookback_days}-day Sharpe & RS (Live Mark Prices)...")
 
     for coin, sym in symbol_map.items():
-        df = fetch_kraken_daily_candles(sym)
-        if df is None or len(df) < lookback_days + 3:
+        if sym not in live_tickers:
+            continue
+        c_now = float(live_tickers[sym].get("markPrice", 0.0))
+        if c_now <= 0:
             continue
 
-        closed = df.iloc[:-1]
-        c_now = float(closed.iloc[-1]["close"])
-        c_past = float(closed.iloc[-lookback_days - 1]["close"])
+        df = fetch_kraken_daily_candles(sym)
+        if df is None or len(df) < lookback_days + 2:
+            continue
+
+        # Lookback price from lookback_days ago
+        c_past = float(df["close"].iloc[-lookback_days - 1])
         if c_past <= 0:
             continue
 
         ret_7d = (c_now - c_past) / c_past
 
-        # 7-day volatility (annualized)
-        daily_rets = closed.iloc[-lookback_days - 1:]["close"].pct_change().dropna()
-        vol_7d = float(daily_rets.std() * np.sqrt(365.25)) if len(daily_rets) >= 5 else 1.0
+        # 7-day volatility from daily closes
+        daily_rets = df["close"].pct_change().tail(lookback_days).dropna()
+        vol_7d = float(daily_rets.std() * np.sqrt(365.25)) if len(daily_rets) >= 4 else 1.0
         if np.isnan(vol_7d) or vol_7d < 0.05:
             vol_7d = 0.05
 
@@ -261,7 +272,7 @@ def scan_kraken_universe(symbol_map: Dict[str, str], lookback_days: int = 7) -> 
             "sharpe_score": sharpe_score,
             "rs_spread_pct": rs_spread * 100.0
         })
-        time.sleep(0.04) # politeness delay
+        time.sleep(0.02) # politeness delay
 
     scored.sort(key=lambda x: x["sharpe_score"], reverse=True)
     return scored
@@ -326,9 +337,15 @@ def run_scanner():
     now_utc = pd.Timestamp.now(tz="UTC")
     now_str = now_utc.strftime("%A, %b %d, %Y - %H:%M UTC")
 
-    # 1. Macro Trend Check (PF_XBTUSD 50-day EMA)
-    is_bullish, btc_close, btc_ema50, dist_pct = evaluate_kraken_btc_macro()
-    logger.info(f"BTC Close: ${btc_close:,.2f} | 50 EMA: ${btc_ema50:,.2f} | Bullish: {is_bullish}")
+    # Fetch Real-Time Kraken Live Tickers (Mark Prices)
+    live_tickers = get_kraken_live_tickers()
+    if not live_tickers:
+        logger.error("Failed to query Kraken Futures live tickers.")
+        return
+
+    # 1. Macro Trend Check (PF_XBTUSD Live Price vs 50-day EMA)
+    is_bullish, btc_close, btc_ema50, dist_pct = evaluate_kraken_btc_macro(live_tickers)
+    logger.info(f"BTC Live Mark Price: ${btc_close:,.2f} | 50 EMA: ${btc_ema50:,.2f} | Bullish: {is_bullish}")
 
     # Load State
     old_state = load_portfolio_state()
@@ -362,11 +379,11 @@ def run_scanner():
         return
 
     # 2. Map Breakout coins to Kraken perpetual futures
-    symbol_map, missing = map_breakout_coins_to_kraken(allowed_coins)
+    symbol_map, missing = map_breakout_coins_to_kraken(allowed_coins, live_tickers)
     logger.info(f"Active Breakout coins on Kraken: {len(symbol_map)} / {len(allowed_coins)}")
 
-    # 3. Score Breakout universe for trailing 7-day Sharpe Momentum
-    scored = scan_kraken_universe(symbol_map, lookback_days=lookback)
+    # 3. Score Breakout universe for trailing 7-day Sharpe Momentum (Live Mark Prices)
+    scored = scan_kraken_universe(symbol_map, live_tickers, lookback_days=lookback)
     for idx, item in enumerate(scored, 1):
         item["rank"] = idx
 
