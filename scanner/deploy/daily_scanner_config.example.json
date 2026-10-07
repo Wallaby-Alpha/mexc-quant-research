@@ -1,0 +1,10 @@
+{
+  "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
+  "telegram_chat_id": "YOUR_TELEGRAM_CHAT_ID_HERE",
+  "top_k_quality": 7,
+  "top_k_raw": 3,
+  "rank_exit_buffer_quality": 12,
+  "rank_exit_buffer_raw": 6,
+  "lookback_days": 7,
+  "min_volume_24h_usdt": 500000.0
+}
