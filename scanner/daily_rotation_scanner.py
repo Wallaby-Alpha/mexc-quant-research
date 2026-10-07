@@ -1,10 +1,17 @@
 """
 scanner/daily_rotation_scanner.py
 Production-ready daily scanner for the 24-Hour Rebalance / 7-Day Lookback Rotational Momentum Strategy.
-Evaluates BTC 50-day EMA macro health daily at 00:00 UTC, ranks liquid MEXC altcoins by trailing 7-day
-Sharpe momentum and Relative Strength vs BTC, applies buffer rules to smooth daily turnover, resolves
-blockchain networks (Solana, Base, BSC, L1s), constructs the active 10-coin portfolio (7 Quality + 3 Raw),
-and sends actionable step-by-step instructions via Telegram.
+Supports:
+1. Kraken Breakout Universe: Restricts strictly to the 65 Breakout Prop Firm tradeable coins.
+2. Dual Data Sources:
+   - "kraken" (Default): Direct Kraken Futures REST API (PF_XBTUSD, PF_<COIN>USD).
+   - "mexc": MEXC Spot API restricted to the Breakout coin universe.
+3. Prop-Firm Risk & Execution Model:
+   - Bitcoin 50-Day EMA Macro Health Gate.
+   - Sizing calibrated to prop firm drawdown limits (e.g. 15%-25% total exposure / 3%-4% per coin).
+   - Bracket order instructions: Hard SL (-3.5%), TP1 (+9.0% / scale 50%), TP2 (+18.0% / scale 25%).
+   - Turnover smoothing buffers (keeps churn minimal on daily rebalances).
+   - Direct Telegram alerts.
 """
 
 import os
@@ -37,12 +44,30 @@ logging.basicConfig(
 logger = logging.getLogger("daily_rotation_scanner")
 
 MEXC_BASE_URL = "https://api.mexc.com"
+KRAKEN_FUTURES_TICKERS_URL = "https://futures.kraken.com/derivatives/api/v3/tickers"
+KRAKEN_FUTURES_CHART_URL = "https://futures.kraken.com/api/charts/v1/trade/{symbol}/1d"
+
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+# Verified Breakout Supported Coin Universe (65 Assets)
+DEFAULT_BREAKOUT_UNIVERSE = [
+    "BCH", "LIGHTER", "MON", "STX", "ETHFI", "JTO", "PEPE", "ENA", "WIF",
+    "SUI", "NEAR", "GRASS", "UNI", "AAVE", "ADA", "AIXBT", "ALGO", "APT",
+    "ARB", "ASTER", "ATOM", "AVAX", "BNB", "BONK", "CRV", "DOGE", "DOT",
+    "ETC", "ETH", "FARTCOIN", "FIL", "FLOKI", "HBAR", "HYPE", "ICP",
+    "INJ", "JUP", "KAITO", "LDO", "LINK", "LTC", "MOODENG", "ONDO", "OP",
+    "PENDLE", "PENGU", "PNUT", "POL", "POPCAT", "PUMP", "RENDER", "S",
+    "SHIB", "SOL", "TAO", "TIA", "TRUMP", "TRX", "VIRTUAL", "WLD", "XLM",
+    "XPL", "XRP", "ZEC", "ZRO"
+]
+
 
 def get_config_file() -> Optional[Path]:
     candidates = [
         Path("daily_scanner_config.json"),
         SCRIPT_DIR / "daily_scanner_config.json",
+        Path("kraken_breakout_config.json"),
+        SCRIPT_DIR / "kraken_breakout_config.json",
         Path("scanner_config.json"),
         SCRIPT_DIR / "scanner_config.json",
         SCRIPT_DIR / "deploy" / "daily_scanner_config.example.json",
@@ -52,6 +77,7 @@ def get_config_file() -> Optional[Path]:
             return c
     return None
 
+
 def get_state_file() -> Path:
     if Path("portfolio_state_daily.json").exists():
         return Path("portfolio_state_daily.json")
@@ -59,169 +85,47 @@ def get_state_file() -> Path:
         return SCRIPT_DIR / "portfolio_state_daily.json"
     return Path("portfolio_state_daily.json")
 
-# Known Native Layer 1s / Layer 2s
-NATIVE_L1_CHAINS = {
-    "BTC": "Bitcoin L1",
-    "ETH": "Ethereum L1",
-    "SOL": "Solana L1",
-    "NEAR": "NEAR L1",
-    "RUNE": "THORChain L1",
-    "MOVR": "Moonriver EVM",
-    "GLMR": "Moonbeam EVM",
-    "SUI": "Sui L1",
-    "APT": "Aptos L1",
-    "SEI": "Sei L1",
-    "AVAX": "Avalanche C-Chain",
-    "DOT": "Polkadot L1",
-    "ATOM": "Cosmos L1",
-    "ADA": "Cardano L1",
-    "TON": "TON L1",
-    "KAS": "Kaspa L1",
-    "TAO": "Bittensor L1",
-    "XRP": "XRP Ledger",
-    "DOGE": "Dogecoin L1",
-    "LTC": "Litecoin L1",
-    "TRX": "Tron L1",
-    "INJ": "Injective L1",
-    "FTM": "Fantom / Sonic",
-    "ICP": "Internet Computer L1",
-    "HBAR": "Hedera L1",
-    "ALGO": "Algorand L1",
-}
-
-CHAIN_CACHE: Dict[str, str] = {}
-
-
-def format_chain_name(raw_chain: str) -> str:
-    """Formats chain identifiers nicely for display."""
-    mapping = {
-        "solana": "Solana",
-        "base": "Base",
-        "bsc": "BSC",
-        "ethereum": "Ethereum",
-        "arbitrum": "Arbitrum",
-        "optimism": "Optimism",
-        "polygon": "Polygon",
-        "avalanche": "Avalanche",
-        "sui": "Sui",
-        "aptos": "Aptos",
-        "ton": "TON",
-        "fantom": "Fantom",
-        "blast": "Blast",
-        "mantle": "Mantle",
-        "linea": "Linea",
-        "scroll": "Scroll",
-        "ronin": "Ronin"
-    }
-    return mapping.get(raw_chain.lower(), raw_chain.title())
-
-
-def get_mexc_exchange_info() -> Dict[str, Any]:
-    """Fetches full symbol metadata from MEXC exchangeInfo."""
-    url = f"{MEXC_BASE_URL}/api/v3/exchangeInfo"
-    try:
-        resp = requests.get(url, timeout=12)
-        if resp.status_code == 200:
-            data = resp.json()
-            return {s["symbol"]: s for s in data.get("symbols", [])}
-    except Exception as e:
-        logger.warning(f"Failed to fetch exchangeInfo: {e}")
-    return {}
-
-
-def resolve_chain(symbol: str, exchange_info: Dict[str, Any]) -> str:
-    """Resolves blockchain network for a given symbol."""
-    if symbol in CHAIN_CACHE:
-        return CHAIN_CACHE[symbol]
-
-    base = symbol.replace("USDT", "")
-    if base in NATIVE_L1_CHAINS:
-        chain_name = NATIVE_L1_CHAINS[base]
-        CHAIN_CACHE[symbol] = chain_name
-        return chain_name
-
-    info = exchange_info.get(symbol, {})
-    contract = info.get("contractAddress", "").strip()
-
-    chain_name = "Unknown"
-    if contract:
-        try:
-            r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{contract}", timeout=3)
-            if r.status_code == 200:
-                pairs = r.json().get("pairs", [])
-                if pairs:
-                    cid = pairs[0].get("chainId", "").lower()
-                    chain_name = format_chain_name(cid)
-        except Exception:
-            pass
-
-        if chain_name == "Unknown":
-            if not contract.startswith("0x") and len(contract) >= 32:
-                chain_name = "Solana"
-            elif contract.startswith("0x"):
-                chain_name = "EVM"
-
-    if chain_name == "Unknown":
-        plates = info.get("conceptPlates", [])
-        if plates:
-            chain_name = plates[0]
-        else:
-            chain_name = "MEXC Spot"
-
-    CHAIN_CACHE[symbol] = chain_name
-    return chain_name
-
 
 def load_config() -> Dict[str, Any]:
     """Loads configuration and Telegram credentials for daily scanner."""
     config = {
+        "exchange": os.environ.get("EXCHANGE", "kraken").lower(), # "kraken" or "mexc"
+        "universe_mode": os.environ.get("UNIVERSE_MODE", "kraken_breakout"), # "kraken_breakout" or "all_liquid_mexc"
         "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
-        "top_k_quality": int(os.environ.get("TOP_K_QUALITY", "7")),
-        "top_k_raw": int(os.environ.get("TOP_K_RAW", "3")),
-        "rank_exit_buffer_quality": int(os.environ.get("BUFFER_QUALITY", "12")),
-        "rank_exit_buffer_raw": int(os.environ.get("BUFFER_RAW", "6")),
-        "lookback_days": int(os.environ.get("LOOKBACK_DAYS", "7")), # Default 7 days for daily cadence
-        "min_volume_24h_usdt": float(os.environ.get("MIN_VOLUME_USDT", "500000.0")),
+        "account_size_usd": float(os.environ.get("ACCOUNT_SIZE_USD", "100000.0")),
+        "total_exposure_pct": float(os.environ.get("TOTAL_EXPOSURE_PCT", "20.0")), # 20% total account exposure
+        "top_k": int(os.environ.get("TOP_K", "5")), # Top 5 coins
+        "rank_exit_buffer": int(os.environ.get("RANK_EXIT_BUFFER", "8")), # Only exit if drops below rank 8
+        "lookback_days": int(os.environ.get("LOOKBACK_DAYS", "7")), # Default 7 days
+        "stop_loss_pct": float(os.environ.get("STOP_LOSS_PCT", "3.5")), # -3.5% hard stop
+        "take_profit_1_pct": float(os.environ.get("TAKE_PROFIT_1_PCT", "9.0")), # +9.0% (sell 50%)
+        "take_profit_2_pct": float(os.environ.get("TAKE_PROFIT_2_PCT", "18.0")), # +18.0% (sell 25%)
+        "allowed_coins": DEFAULT_BREAKOUT_UNIVERSE
     }
-    
-    # Try loading config from resolved candidate paths
-    cfg_to_read = get_config_file()
-    if cfg_to_read:
+
+    cfg_file = get_config_file()
+    if cfg_file:
         try:
-            with open(cfg_to_read, "r", encoding="utf-8") as f:
+            with open(cfg_file, "r", encoding="utf-8") as f:
                 file_cfg = json.load(f)
                 config.update(file_cfg)
-                logger.info(f"Loaded config from {cfg_to_read}")
+                logger.info(f"Loaded config from {cfg_file}")
         except Exception as e:
-            logger.warning(f"Failed to read {cfg_to_read}: {e}")
+            logger.warning(f"Failed to read {cfg_file}: {e}")
 
     return config
 
 
 def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
-    """Dispatches formatted message to Telegram Bot, auto-chunking if length > 3800."""
+    """Dispatches formatted message to Telegram Bot with auto-chunking."""
     if not token or not chat_id:
         logger.warning("Telegram token or chat_id not configured. Printing message to stdout only.")
         return False
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    
     max_len = 3800
-    chunks = []
-    if len(text) <= max_len:
-        chunks = [text]
-    else:
-        current_chunk = ""
-        for line in text.split("\n"):
-            if len(current_chunk) + len(line) + 1 > max_len:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = line + "\n"
-            else:
-                current_chunk += line + "\n"
-        if current_chunk.strip():
-            chunks.append(current_chunk.strip())
+    chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)]
 
     success = True
     for i, chunk in enumerate(chunks):
@@ -231,96 +135,141 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
             "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
-        try:
-            resp = requests.post(url, json=payload, timeout=12)
-            if resp.status_code == 200:
-                logger.info(f"Successfully sent Telegram alert part {i+1}/{len(chunks)}.")
-            else:
-                logger.error(f"Telegram API error {resp.status_code}: {resp.text}")
-                success = False
-        except Exception as e:
-            logger.error(f"Failed to send Telegram message: {e}")
-            success = False
+        for attempt in range(3):
+            try:
+                resp = requests.post(url, json=payload, timeout=12)
+                if resp.status_code == 200:
+                    break
+                else:
+                    time.sleep(1)
+            except Exception:
+                time.sleep(1)
         if len(chunks) > 1 and i < len(chunks) - 1:
             time.sleep(0.5)
 
     return success
 
 
-def get_mexc_klines(symbol: str, interval: str = "1d", limit: int = 100) -> pd.DataFrame:
-    """Fetches daily klines from MEXC public REST API with retries."""
-    url = f"{MEXC_BASE_URL}/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+# -----------------------------------------------------------------------------
+# KRAKEN FUTURES API METHODS
+# -----------------------------------------------------------------------------
+def fetch_kraken_daily_candles(symbol: str) -> Optional[pd.DataFrame]:
+    """Fetches historical daily candles from Kraken Futures."""
+    url = KRAKEN_FUTURES_CHART_URL.format(symbol=symbol)
     for attempt in range(3):
         try:
-            resp = requests.get(url, params=params, timeout=15)
+            resp = requests.get(url, timeout=10)
             if resp.status_code != 200:
-                time.sleep(0.5)
+                time.sleep(0.3)
                 continue
-            data = resp.json()
-            if not data or not isinstance(data, list):
-                return pd.DataFrame()
-
-            df = pd.DataFrame(data, columns=[
-                "open_time", "open", "high", "low", "close", "volume", "close_time", "quote_volume"
-            ])
-            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-            for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
+            candles = resp.json().get("candles", [])
+            if not candles:
+                return None
+            df = pd.DataFrame(candles)
+            df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+            for col in ["open", "high", "low", "close", "volume"]:
                 df[col] = df[col].astype(float)
-            return df.sort_values("open_time").reset_index(drop=True)
+            return df.sort_values("time").reset_index(drop=True)
         except Exception as e:
-            if attempt == 2:
-                logger.warning(f"Error fetching klines for {symbol}: {e}")
-            time.sleep(0.8)
-    return pd.DataFrame()
+            time.sleep(0.5)
+    return None
 
 
-def get_top_mexc_pairs(min_volume: float = 500000.0) -> List[str]:
-    """Retrieves liquid USDT spot trading pairs on MEXC."""
-    url = f"{MEXC_BASE_URL}/api/v3/ticker/24hr"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code != 200:
-            return []
-        data = resp.json()
+def evaluate_kraken_btc_macro() -> Tuple[bool, float, float, float]:
+    """Checks BTC 50-day EMA on Kraken Futures PF_XBTUSD."""
+    df_btc = fetch_kraken_daily_candles("PF_XBTUSD")
+    if df_btc is None or len(df_btc) < 55:
+        logger.error("Insufficient PF_XBTUSD candle data.")
+        return False, 0.0, 0.0, 0.0
 
-        pairs = []
-        for item in data:
-            sym = item.get("symbol", "")
-            if not sym.endswith("USDT"):
-                continue
-            if any(x in sym for x in ["3L", "3S", "4L", "4S", "5L", "5S", "USDC", "BUSD", "TUSD", "FDUSD", "EUR", "DAI"]):
-                continue
-
-            quote_vol = float(item.get("quoteVolume", 0.0))
-            if quote_vol >= min_volume:
-                pairs.append((sym, quote_vol))
-
-        pairs.sort(key=lambda x: x[1], reverse=True)
-        top_symbols = [p[0] for p in pairs[:160]]
-        logger.info(f"Retrieved {len(top_symbols)} liquid USDT pairs above ${min_volume:,.0f} 24h volume.")
-        return top_symbols
-    except Exception as e:
-        logger.error(f"Error fetching 24hr tickers: {e}")
-        return []
-
-
-def check_btc_macro_trend() -> Tuple[bool, float, float]:
-    """Evaluates whether Bitcoin daily close is above its 50-day EMA."""
-    df_btc = get_mexc_klines("BTCUSDT", interval="1d", limit=100)
-    if len(df_btc) < 55:
-        logger.error("Insufficient BTC daily bars.")
-        return False, 0.0, 0.0
-
-    df_btc["ema50"] = df_btc["close"].ewm(span=50, adjust=False).mean()
-    latest = df_btc.iloc[-1]
-    btc_close = latest["close"]
-    btc_ema50 = latest["ema50"]
+    closed = df_btc.iloc[:-1].copy()
+    closed["ema50"] = closed["close"].ewm(span=50, adjust=False).mean()
+    latest = closed.iloc[-1]
+    btc_close = float(latest["close"])
+    btc_ema50 = float(latest["ema50"])
+    dist_pct = ((btc_close - btc_ema50) / btc_ema50) * 100.0
     is_bullish = btc_close >= btc_ema50
+    return is_bullish, btc_close, btc_ema50, dist_pct
 
-    return is_bullish, btc_close, btc_ema50
+
+def map_breakout_coins_to_kraken(coins: List[str]) -> Tuple[Dict[str, str], List[str]]:
+    """Maps allowed Breakout coins to active Kraken perpetual futures tickers."""
+    try:
+        resp = requests.get(KRAKEN_FUTURES_TICKERS_URL, timeout=12)
+        tickers = resp.json().get("tickers", [])
+        active = {t["symbol"]: t for t in tickers if not t.get("suspended", False)}
+
+        sym_map = {}
+        missing = []
+        for c in coins:
+            c_clean = c.strip().upper()
+            if f"PF_{c_clean}USD" in active:
+                sym_map[c_clean] = f"PF_{c_clean}USD"
+            elif f"PI_{c_clean}USD" in active:
+                sym_map[c_clean] = f"PI_{c_clean}USD"
+            else:
+                missing.append(c_clean)
+        return sym_map, missing
+    except Exception as e:
+        logger.error(f"Error querying Kraken tickers: {e}")
+        return {}, coins
 
 
+def scan_kraken_universe(symbol_map: Dict[str, str], lookback_days: int = 7) -> List[Dict[str, Any]]:
+    """Scores Kraken Breakout coins by trailing 7-day Sharpe Momentum and Relative Strength."""
+    # First get BTC 7d return
+    df_btc = fetch_kraken_daily_candles("PF_XBTUSD")
+    if df_btc is not None and len(df_btc) > lookback_days + 1:
+        closed_btc = df_btc.iloc[:-1]
+        btc_now = closed_btc.iloc[-1]["close"]
+        btc_past = closed_btc.iloc[-lookback_days - 1]["close"]
+        btc_7d_ret = (btc_now - btc_past) / btc_past
+    else:
+        btc_7d_ret = 0.0
+
+    scored = []
+    logger.info(f"Scanning {len(symbol_map)} Breakout coins on Kraken for {lookback_days}-day Sharpe & RS...")
+
+    for coin, sym in symbol_map.items():
+        df = fetch_kraken_daily_candles(sym)
+        if df is None or len(df) < lookback_days + 3:
+            continue
+
+        closed = df.iloc[:-1]
+        c_now = float(closed.iloc[-1]["close"])
+        c_past = float(closed.iloc[-lookback_days - 1]["close"])
+        if c_past <= 0:
+            continue
+
+        ret_7d = (c_now - c_past) / c_past
+
+        # 7-day volatility (annualized)
+        daily_rets = closed.iloc[-lookback_days - 1:]["close"].pct_change().dropna()
+        vol_7d = float(daily_rets.std() * np.sqrt(365.25)) if len(daily_rets) >= 5 else 1.0
+        if np.isnan(vol_7d) or vol_7d < 0.05:
+            vol_7d = 0.05
+
+        sharpe_score = ret_7d / vol_7d
+        rs_spread = ret_7d - btc_7d_ret
+
+        scored.append({
+            "base": coin,
+            "symbol": sym,
+            "mark_price": c_now,
+            "return_7d_pct": ret_7d * 100.0,
+            "volatility_7d_pct": vol_7d * 100.0,
+            "sharpe_score": sharpe_score,
+            "rs_spread_pct": rs_spread * 100.0
+        })
+        time.sleep(0.04) # politeness delay
+
+    scored.sort(key=lambda x: x["sharpe_score"], reverse=True)
+    return scored
+
+
+# -----------------------------------------------------------------------------
+# PERSISTENT STATE MANAGEMENT
+# -----------------------------------------------------------------------------
 def load_portfolio_state() -> Dict[str, Any]:
     """Loads currently held symbols from daily state file."""
     state_file = get_state_file()
@@ -329,192 +278,129 @@ def load_portfolio_state() -> Dict[str, Any]:
             with open(state_file, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            logger.warning(f"Could not load daily state file {state_file}: {e}")
-    return {"current_quality_holdings": [], "current_raw_holdings": []}
+            logger.warning(f"Could not load state file {state_file}: {e}")
+    return {"current_holdings": []}
 
 
-def save_portfolio_state(quality_holdings: List[str], raw_holdings: List[str]):
+def save_portfolio_state(holdings: List[Dict[str, Any]], macro_status: str):
     """Persists updated portfolio holdings to daily state file."""
     data = {
         "last_updated": pd.Timestamp.now(tz="UTC").isoformat(),
         "cadence": "24h_daily",
         "lookback_days": 7,
-        "current_quality_holdings": quality_holdings,
-        "current_raw_holdings": raw_holdings,
-        "total_active_holdings": quality_holdings + raw_holdings
+        "macro_status": macro_status,
+        "current_holdings": holdings
     }
     state_file = get_state_file()
     with open(state_file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 
+# -----------------------------------------------------------------------------
+# MAIN DAILY EXECUTION ENGINE
+# -----------------------------------------------------------------------------
 def run_scanner():
-    logger.info("=" * 70)
-    logger.info("RUNNING DAILY 24H ROTATIONAL MOMENTUM SCANNER (7D LOOKBACK)")
-    logger.info("=" * 70)
+    logger.info("=" * 80)
+    logger.info("STARTING DAILY KRAKEN BREAKOUT ROTATION SCANNER (7D LOOKBACK / PROP-FIRM RULES)")
+    logger.info("=" * 80)
 
     cfg = load_config()
-    state = load_portfolio_state()
-    held_quality = state.get("current_quality_holdings", [])
-    held_raw = state.get("current_raw_holdings", [])
-    all_held = held_quality + held_raw
+    token = cfg["telegram_bot_token"]
+    chat_id = cfg["telegram_chat_id"]
+    account_size = cfg["account_size_usd"]
+    total_exposure_pct = cfg["total_exposure_pct"]
+    top_k = cfg["top_k"]
+    buf_rank = cfg["rank_exit_buffer"]
+    lookback = cfg["lookback_days"]
+    sl_pct = cfg["stop_loss_pct"]
+    tp1_pct = cfg["take_profit_1_pct"]
+    tp2_pct = cfg["take_profit_2_pct"]
+    allowed_coins = cfg.get("allowed_coins", DEFAULT_BREAKOUT_UNIVERSE)
 
-    # 1. Evaluate Bitcoin Macro Health
-    is_btc_bullish, btc_close, btc_ema50 = check_btc_macro_trend()
-    logger.info(f"BTC Price: ${btc_close:,.2f} | 50-day EMA: ${btc_ema50:,.2f} | Bullish: {is_btc_bullish}")
+    # Sizing for Prop Firm
+    total_capital = account_size * (total_exposure_pct / 100.0)
+    capital_per_coin = total_capital / top_k
+    pct_per_coin = total_exposure_pct / top_k
+    cash_reserved = account_size - total_capital
 
-    now_utc = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
+    now_utc = pd.Timestamp.now(tz="UTC")
+    now_str = now_utc.strftime("%A, %b %d, %Y - %H:%M UTC")
 
-    # If BTC is Bearish -> Cash Protection Mode
-    if not is_btc_bullish:
+    # 1. Macro Trend Check (PF_XBTUSD 50-day EMA)
+    is_bullish, btc_close, btc_ema50, dist_pct = evaluate_kraken_btc_macro()
+    logger.info(f"BTC Close: ${btc_close:,.2f} | 50 EMA: ${btc_ema50:,.2f} | Bullish: {is_bullish}")
+
+    # Load State
+    old_state = load_portfolio_state()
+    held_list = old_state.get("current_holdings", [])
+    held_bases = [h.get("base", "") for h in held_list if h.get("base")]
+
+    # BEARISH REGIME: Cash Shield
+    if not is_bullish:
+        logger.info("BTC is below 50-day EMA. Triggering 100% Cash Defense.")
+        sell_lines = []
+        for h in held_list:
+            sell_lines.append(f"🔴 <b>SELL/CLOSE 100%:</b> <code>{h.get('symbol', h.get('base'))}</code>")
+        sells_txt = "\n".join(sell_lines) if sell_lines else "✅ <i>Already 100% in Cash Margin. No positions open.</i>"
+
         msg = (
-            f"🚨 <b>DAILY ROTATION SCANNER: CASH SHIELD TRIGGERED</b>\n"
-            f"📅 <i>{now_utc}</i>\n\n"
-            f"<b>BTC Macro Trend:</b> ❌ <b>BEARISH</b> (Below 50 EMA)\n"
-            f"• BTC Price: <code>${btc_close:,.2f}</code>\n"
-            f"• 50-Day EMA: <code>${btc_ema50:,.2f}</code>\n"
-            f"• Trend Deficit: <code>{(btc_close - btc_ema50) / btc_ema50 * 100:+.2f}%</code>\n\n"
+            f"🛡️ <b>DAILY BREAKOUT SCANNER: CASH DEFENSE TRIGGERED</b>\n"
+            f"📅 <i>{now_str}</i>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📋 <b>ACTION REQUIRED: PROTECT CAPITAL</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 <b>BTC Macro Regime:</b> ❌ <b>BEARISH</b> (Below 50-day EMA)\n"
+            f"• BTC Price: <code>${btc_close:,.2f}</code>\n"
+            f"• 50 EMA: <code>${btc_ema50:,.2f}</code> (<b>{dist_pct:+.2f}%</b>)\n\n"
+            f"🚨 <b>PROP FIRM ACTION REQUIRED:</b>\n"
+            f"Preserve challenge equity in 100% Cash/Margin. Do not take altcoin longs.\n\n"
+            f"{sells_txt}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💼 <b>Cash Margin:</b> 100% ($0 at risk) | Protecting Trailing Drawdown Floor"
         )
-        if all_held:
-            msg += "<b>SELL 100% OF EXISTING HOLDINGS TO USDT:</b>\n"
-            for s in all_held:
-                msg += f"🔴 <b>SELL</b> <code>{s}</code>\n"
-            save_portfolio_state([], [])
-        else:
-            msg += "✅ <b>Portfolio is already 100% in USDT Cash.</b> No actions needed.\n"
-
-        print(msg)
-        send_telegram_message(cfg["telegram_bot_token"], cfg["telegram_chat_id"], msg)
+        print("\n" + msg + "\n")
+        send_telegram_message(token, chat_id, msg)
+        save_portfolio_state([], "BEARISH_CASH")
         return
 
-    # 2. Retrieve liquid universe
-    universe = get_top_mexc_pairs(min_volume=cfg["min_volume_24h_usdt"])
-    exchange_info = get_mexc_exchange_info()
+    # 2. Map Breakout coins to Kraken perpetual futures
+    symbol_map, missing = map_breakout_coins_to_kraken(allowed_coins)
+    logger.info(f"Active Breakout coins on Kraken: {len(symbol_map)} / {len(allowed_coins)}")
 
-    # 3. Trailing BTC Return over lookback_days (7 days)
-    lookback = cfg["lookback_days"] # 7
-    df_btc = get_mexc_klines("BTCUSDT", interval="1d", limit=lookback + 5)
-    if len(df_btc) > lookback:
-        btc_past = df_btc.iloc[-lookback - 1]["close"]
-        btc_now = df_btc.iloc[-1]["close"]
-        btc_7d_return = (btc_now - btc_past) / btc_past
-    else:
-        btc_7d_return = 0.0
+    # 3. Score Breakout universe for trailing 7-day Sharpe Momentum
+    scored = scan_kraken_universe(symbol_map, lookback_days=lookback)
+    for idx, item in enumerate(scored, 1):
+        item["rank"] = idx
 
-    # 4. Compute 7-day Relative Strength & Sharpe Scores across Universe
-    scored_coins = []
-    logger.info(f"Computing 7-day momentum and Sharpe features across {len(universe)} pairs...")
+    df_scored = pd.DataFrame(scored)
 
-    for sym in universe:
-        df_k = get_mexc_klines(sym, interval="1d", limit=lookback + 15)
-        if len(df_k) < lookback + 1:
-            continue
+    # 4. Apply Daily Buffer Rules
+    buffer_bases = [item["base"] for item in scored[:buf_rank]]
+    top_bases = [item["base"] for item in scored[:top_k]]
 
-        alt_close_now = df_k.iloc[-1]["close"]
-        alt_close_past = df_k.iloc[-lookback - 1]["close"]
-        if alt_close_past <= 0:
-            continue
+    # Sells: held coins that fell below rank buffer
+    sells = [h for h in held_list if h.get("base") not in buffer_bases]
+    # Holds: held coins still within buffer
+    holds = [h for h in held_list if h.get("base") in buffer_bases]
 
-        alt_ret = (alt_close_now - alt_close_past) / alt_close_past
+    needed = top_k - len(holds)
+    buys = []
+    for item in scored[:top_k]:
+        if item["base"] not in [h["base"] for h in holds] and len(buys) < needed:
+            buys.append(item)
 
-        # Trailing 7-day Volatility
-        daily_rets = df_k.iloc[-lookback - 1:]["close"].pct_change().dropna()
-        vol = float(daily_rets.std() * np.sqrt(365.25)) if len(daily_rets) >= 5 else 1.0
-        if np.isnan(vol) or vol < 0.05:
-            vol = 0.05
+    # New final holdings
+    final_holdings = holds + buys
 
-        sharpe_score = alt_ret / vol
-        rs_spread = alt_ret - btc_7d_return
-
-        scored_coins.append({
-            "symbol": sym,
-            "price": alt_close_now,
-            "alt_return_7d": alt_ret,
-            "volatility_7d": vol,
-            "sharpe_score": sharpe_score,
-            "rs_spread_vs_btc": rs_spread
-        })
-
-    if not scored_coins:
-        logger.error("No valid scored coins available.")
-        return
-
-    df_all = pd.DataFrame(scored_coins)
-
-    # A. Quality Ranking (Sharpe Momentum: 7d Return / 7d Vol)
-    df_quality = df_all.sort_values(by="sharpe_score", ascending=False).reset_index(drop=True)
-    df_quality["rank_quality"] = df_quality.index + 1
-
-    # B. Raw Ranking (Relative Strength Spread vs BTC)
-    df_raw = df_all.sort_values(by="rs_spread_vs_btc", ascending=False).reset_index(drop=True)
-    df_raw["rank_raw"] = df_raw.index + 1
-
-    k_quality = cfg["top_k_quality"] # 7
-    k_raw = cfg["top_k_raw"]         # 3
-    buf_quality = cfg["rank_exit_buffer_quality"] # 12
-    buf_raw = cfg["rank_exit_buffer_raw"]         # 6
-
-    # 5. Apply Daily Buffer Rules
-    quality_buffer_symbols = df_quality.head(buf_quality)["symbol"].tolist()
-    quality_top_symbols = df_quality.head(k_quality)["symbol"].tolist()
-
-    holds_quality = [s for s in held_quality if s in quality_buffer_symbols]
-    sells_quality = [s for s in held_quality if s not in quality_buffer_symbols]
-    slots_needed_quality = k_quality - len(holds_quality)
-
-    buys_quality = []
-    for s in quality_top_symbols:
-        if s not in holds_quality and len(buys_quality) < slots_needed_quality:
-            buys_quality.append(s)
-
-    final_quality_holdings = holds_quality + buys_quality
-
-    # Raw Selection (prevent overlap with quality)
-    df_raw_filtered = df_raw[~df_raw["symbol"].isin(final_quality_holdings)].reset_index(drop=True)
-    raw_buffer_symbols = df_raw_filtered.head(buf_raw)["symbol"].tolist()
-    raw_top_symbols = df_raw_filtered.head(k_raw)["symbol"].tolist()
-
-    holds_raw = [s for s in held_raw if s in raw_buffer_symbols and s not in final_quality_holdings]
-    sells_raw = [s for s in held_raw if s not in holds_raw]
-    slots_needed_raw = k_raw - len(holds_raw)
-
-    buys_raw = []
-    for s in raw_top_symbols:
-        if s not in holds_raw and len(buys_raw) < slots_needed_raw:
-            buys_raw.append(s)
-
-    final_raw_holdings = holds_raw + buys_raw
-    total_new_holdings = final_quality_holdings + final_raw_holdings
-
-    all_sells = list(set(sells_quality + sells_raw))
-    all_buys = buys_quality + buys_raw
-    all_holds = holds_quality + holds_raw
-
-    # Resolve chains
-    coin_chains = {s: resolve_chain(s, exchange_info) for s in total_new_holdings}
-    for s in all_sells + all_buys:
-        if s not in coin_chains:
-            coin_chains[s] = resolve_chain(s, exchange_info)
-
-    chain_counts: Dict[str, int] = {}
-    for s in total_new_holdings:
-        ch = coin_chains.get(s, "Unknown")
-        chain_counts[ch] = chain_counts.get(ch, 0) + 1
-    chain_dist_str = " | ".join([f"{ch}: {cnt}" for ch, cnt in sorted(chain_counts.items(), key=lambda x: x[1], reverse=True)])
-
-    # 6. Format Telegram Message
+    # 5. Format Telegram Message
     msg = (
-        f"⚡ <b>DAILY 24H ROTATION SCANNER (7D LOOKBACK)</b>\n"
-        f"📅 <i>{now_utc}</i>\n\n"
-        f"<b>BTC Macro Trend:</b> ✅ <b>BULLISH</b> (Above 50 EMA)\n"
-        f"• BTC Price: <code>${btc_close:,.2f}</code> (EMA50: <code>${btc_ema50:,.2f}</code>)\n"
-        f"• BTC 7d Return: <code>{btc_7d_return*100:+.1f}%</code>\n"
-        f"• Allocation: <b>7 Quality (Sharpe) + 3 Raw (High-Beta)</b>\n"
-        f"• Buffer Rules: <b>Quality Rank ≤ {buf_quality} | Raw Rank ≤ {buf_raw}</b>\n"
-        f"• ⛓️ <b>Chain Exposure:</b> <i>{chain_dist_str}</i>\n\n"
+        f"⚡ <b>DAILY BREAKOUT PROP SCANNER (24H / 7D LOOKBACK)</b>\n"
+        f"📅 <i>{now_str}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>BTC Macro Regime:</b> ✅ <b>BULLISH</b> (Above 50-day EMA)\n"
+        f"• BTC Price: <code>${btc_close:,.2f}</code> | 50 EMA: <code>${btc_ema50:,.2f}</code> (<b>{dist_pct:+.2f}%</b>)\n"
+        f"• Universe: <b>Kraken Breakout Futures ({len(symbol_map)} assets)</b>\n"
+        f"• Total Exposure: <b>{total_exposure_pct:.1f}%</b> (${total_capital:,.0f} across {top_k} coins / ~${capital_per_coin:,.0f} each)\n"
+        f"• Cash Buffer: <b>{100-total_exposure_pct:.1f}%</b> (${cash_reserved:,.0f} reserve)\n"
+        f"• Buffer Rule: <b>Rank ≤ {buf_rank}</b> (only sell if drops past #{buf_rank})\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 <b>DAILY ACTION INSTRUCTIONS:</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -522,60 +408,55 @@ def run_scanner():
 
     # Step 1: Sells
     msg += "<b>STEP 1: EXECUTE SELLS (Dropped Below Buffer)</b>\n"
-    if all_sells:
-        for s in all_sells:
-            ch = coin_chains.get(s, "Unknown")
-            msg += f"🔴 <b>SELL 100%</b> of <code>{s}</code> [{ch}] to USDT\n"
-        msg += "<i>➡️ Consolidate proceeds into USDT cash.</i>\n\n"
+    if sells:
+        for s in sells:
+            msg += f"🔴 <b>CLOSE 100%:</b> <code>{s.get('symbol', s.get('base'))}</code>\n"
+        msg += "<i>➡️ Consolidate proceeds back into margin cash.</i>\n\n"
     else:
-        msg += "✅ <i>None! No held coins dropped out of buffer.</i>\n\n"
+        msg += "✅ <i>None! All held coins remain inside the Top " + str(buf_rank) + " buffer.</i>\n\n"
 
     # Step 2: Buys
-    msg += f"<b>STEP 2: EXECUTE BUYS ({len(all_buys)} Slot{'s' if len(all_buys) != 1 else ''} Open)</b>\n"
-    if all_buys:
-        msg += f"<i>Allocate ~10% per open slot:</i>\n"
-        for s in buys_quality:
-            row = df_quality[df_quality["symbol"] == s].iloc[0]
-            ch = coin_chains.get(s, "Unknown")
-            msg += f"🟢 <b>BUY</b> <code>{s}</code> [{ch} | Quality #Q{row['rank_quality']} | 7d: {row['alt_return_7d']*100:+.1f}% | Sharpe: {row['sharpe_score']:.2f}]\n"
-        for s in buys_raw:
-            row = df_raw[df_raw["symbol"] == s].iloc[0]
-            ch = coin_chains.get(s, "Unknown")
-            msg += f"🚀 <b>BUY</b> <code>{s}</code> [{ch} | Raw #R{row['rank_raw']} | 7d: {row['alt_return_7d']*100:+.1f}% | RS: {row['rs_spread_vs_btc']*100:+.1f}%]\n"
-        msg += "\n"
+    msg += f"<b>STEP 2: EXECUTE BUYS ({len(buys)} Slot{'s' if len(buys) != 1 else ''} Open)</b>\n"
+    if buys:
+        msg += f"<i>Deploy ~${capital_per_coin:,.0f} (~{pct_per_coin:.1f}%) per open slot with bracket orders:</i>\n\n"
+        for b in buys:
+            p = b["mark_price"]
+            sl_price = p * (1.0 - sl_pct / 100.0)
+            tp1_price = p * (1.0 + tp1_pct / 100.0)
+            tp2_price = p * (1.0 + tp2_pct / 100.0)
+            msg += (
+                f"🟢 <b>BUY:</b> <code>{b['symbol']}</code> (#{b['rank']} | Sharpe: {b['sharpe_score']:.2f})\n"
+                f"   • Mark: <code>${p:,.4f}</code> | 7d: <code>{b['return_7d_pct']:+.1f}%</code>\n"
+                f"   • 🛑 <b>Hard SL (-{sl_pct}%):</b> <code>${sl_price:,.4f}</code>\n"
+                f"   • 🎯 <b>TP 1 (+{tp1_pct}%):</b> <code>${tp1_price:,.4f}</code> (Scale 50% & move SL to BE)\n"
+                f"   • 🚀 <b>TP 2 (+{tp2_pct}%):</b> <code>${tp2_price:,.4f}</code> (Scale 25%)\n\n"
+            )
     else:
         msg += "✨ <i>Portfolio is at target capacity. No new buys required today!</i>\n\n"
 
     # Step 3: Holds
-    msg += f"<b>STEP 3: CONTINUED HOLDS ({len(all_holds)} Coins Intact)</b>\n"
-    if all_holds:
-        for s in holds_quality:
-            row = df_quality[df_quality["symbol"] == s].iloc[0] if s in df_quality["symbol"].values else None
-            q_rk = f"#Q{row['rank_quality']}" if row is not None else "Rank OK"
-            ch = coin_chains.get(s, "Unknown")
-            msg += f"🛡️ <b>HOLD</b> <code>{s}</code> [{ch} | Quality {q_rk}]\n"
-        for s in holds_raw:
-            row = df_raw[df_raw["symbol"] == s].iloc[0] if s in df_raw["symbol"].values else None
-            r_rk = f"#R{row['rank_raw']}" if row is not None else "Rank OK"
-            ch = coin_chains.get(s, "Unknown")
-            msg += f"⚡ <b>HOLD</b> <code>{s}</code> [{ch} | Raw {r_rk}]\n"
+    msg += f"<b>STEP 3: CONTINUED HOLDS ({len(holds)} Coins Intact)</b>\n"
+    if holds:
+        for h in holds:
+            curr_match = df_scored[df_scored["base"] == h.get("base")]
+            curr_rank = f"#{curr_match.iloc[0]['rank']}" if not curr_match.empty else "Active"
+            msg += f"🛡️ <b>HOLD:</b> <code>{h.get('symbol', h.get('base'))}</code> (Current Rank: {curr_rank})\n"
         msg += "\n"
 
-    # Top 5 Alternates
+    # Top 5 Reserves
     msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "📌 <b>TOP 5 RESERVE BENCH (If a coin is unavailable):</b>\n"
-    top_reserves = [s for s in df_quality["symbol"] if s not in total_new_holdings][:5]
-    for idx, sym in enumerate(top_reserves, 1):
-        row = df_quality[df_quality["symbol"] == sym].iloc[0]
-        ch = resolve_chain(sym, exchange_info)
-        msg += f"{idx}. <code>{sym}</code> [{ch} | 7d: {row['alt_return_7d']*100:+.1f}% | Sharpe: {row['sharpe_score']:.2f}]\n"
+    msg += "📌 <b>TOP 5 RESERVE BENCH:</b>\n"
+    held_final_bases = [h["base"] for h in final_holdings]
+    reserves = [item for item in scored if item["base"] not in held_final_bases][:5]
+    for r in reserves:
+        msg += f"#{r['rank']}. <code>{r['symbol']}</code> [7d: {r['return_7d_pct']:+.1f}% | Sharpe: {r['sharpe_score']:.2f}]\n"
 
-    print(msg)
-    send_telegram_message(cfg["telegram_bot_token"], cfg["telegram_chat_id"], msg)
+    print("\n" + msg + "\n")
+    send_telegram_message(token, chat_id, msg)
 
     # Save State
-    save_portfolio_state(final_quality_holdings, final_raw_holdings)
-    logger.info("Daily scanner cycle completed successfully. State saved.")
+    save_portfolio_state(final_holdings, "BULLISH_ACTIVE")
+    logger.info("Daily Kraken Breakout scanner finished successfully.")
 
 
 if __name__ == "__main__":
