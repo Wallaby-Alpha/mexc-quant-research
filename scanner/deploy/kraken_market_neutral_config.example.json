@@ -1,0 +1,13 @@
+{
+  "hedge_mode": "btc_hedge",
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
+  "account_size_usd": 100000.0,
+  "gross_exposure_pct": 25.0,
+  "top_k": 3,
+  "rank_exit_buffer": 6,
+  "lookback_days": 7,
+  "stop_loss_pct": 3.5,
+  "take_profit_1_pct": 8.0,
+  "take_profit_2_pct": 15.0
+}
