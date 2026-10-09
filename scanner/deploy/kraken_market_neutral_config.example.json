@@ -9,5 +9,8 @@
   "lookback_days": 7,
   "stop_loss_pct": 3.5,
   "take_profit_1_pct": 8.0,
-  "take_profit_2_pct": 15.0
+  "take_profit_2_pct": 15.0,
+  "breadth_ema_period": 20,
+  "breadth_expansion_threshold": 50.0,
+  "regime_mode": "auto"
 }

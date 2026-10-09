@@ -102,8 +102,11 @@ def load_config() -> Dict[str, Any]:
         "rank_exit_buffer": int(os.environ.get("RANK_EXIT_BUFFER", "6")), # Keep long if within top 6
         "lookback_days": int(os.environ.get("LOOKBACK_DAYS", "7")), # 7-day Sharpe
         "stop_loss_pct": float(os.environ.get("STOP_LOSS_PCT", "3.5")), # -3.5% hard stop
-        "take_profit_1_pct": float(os.environ.get("TAKE_PROFIT_1_PCT", "8.0")), # +8.0% (scale 50%)
-        "take_profit_2_pct": float(os.environ.get("TAKE_PROFIT_2_PCT", "15.0")), # +15.0% (scale 25%)
+        "take_profit_1_pct": float(os.environ.get("TAKE_PROFIT_1_pct", "8.0")), # +8.0% (scale 50%)
+        "take_profit_2_pct": float(os.environ.get("TAKE_PROFIT_2_pct", "15.0")), # +15.0% (scale 25%)
+        "breadth_ema_period": int(os.environ.get("BREADTH_EMA_PERIOD", "20")), # 20-day EMA for altcoin breadth
+        "breadth_expansion_threshold": float(os.environ.get("BREADTH_EXPANSION_THRESHOLD", "50.0")), # >=50% = Naked Long expansion
+        "regime_mode": os.environ.get("REGIME_MODE", "auto").lower(), # "auto", "force_hedged", "force_naked_long"
         "allowed_coins": DEFAULT_BREAKOUT_UNIVERSE
     }
 
@@ -192,30 +195,52 @@ def get_kraken_daily_klines(symbol: str, count: int = 15) -> Optional[pd.DataFra
     return None
 
 
-def calculate_coin_metrics(df: pd.DataFrame, lookback_days: int = 7) -> Optional[Dict[str, float]]:
-    """Calculates 7-day Sharpe ratio, return, and volatility using closed bars."""
+def calculate_coin_metrics(
+    df: pd.DataFrame,
+    lookback_days: int = 7,
+    ema_period: int = 20
+) -> Optional[Dict[str, Any]]:
+    """Calculates 7-day Sharpe ratio, return, volatility, and EMA trend using closed bars."""
     if df is None or len(df) < lookback_days + 1:
         return None
     # Use fully closed historical bars
-    closed_df = df.iloc[:-1].tail(lookback_days + 1).copy()
+    closed_df = df.iloc[:-1].copy()
     if len(closed_df) < lookback_days + 1:
         return None
-    rets = closed_df["close"].pct_change().dropna()
+
+    # Calculate 7-day metrics on recent slice
+    calc_slice = closed_df.tail(lookback_days + 1)
+    rets = calc_slice["close"].pct_change().dropna()
     if len(rets) < lookback_days or rets.std() == 0:
         return None
-    ret_7d = float((closed_df["close"].iloc[-1] / closed_df["close"].iloc[0]) - 1.0)
+    ret_7d = float((calc_slice["close"].iloc[-1] / calc_slice["close"].iloc[0]) - 1.0)
     vol_7d = float(rets.std())
     sharpe = float(rets.mean() / vol_7d)
+    latest_close = float(closed_df["close"].iloc[-1])
+
+    # Breadth EMA calculation
+    ema_val = None
+    above_ema = None
+    if len(closed_df) >= ema_period:
+        ema_series = closed_df["close"].ewm(span=ema_period, adjust=False).mean()
+        ema_val = float(ema_series.iloc[-1])
+        above_ema = bool(latest_close > ema_val)
+
     return {
         "sharpe": sharpe,
         "return_7d": ret_7d,
         "vol_7d": vol_7d,
-        "latest_close": float(closed_df["close"].iloc[-1])
+        "latest_close": latest_close,
+        "ema20": ema_val,
+        "above_ema20": above_ema
     }
 
 
-def scan_kraken_breakout_universe(lookback_days: int = 7) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Scans all Breakout universe coins on Kraken Futures."""
+def scan_kraken_breakout_universe(
+    lookback_days: int = 7,
+    ema_period: int = 20
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+    """Scans all Breakout universe coins on Kraken Futures, calculating relative strength and market breadth."""
     logger.info("Fetching real-time mark prices from Kraken Futures tickers API...")
     live_tickers = get_kraken_live_tickers()
 
@@ -246,8 +271,8 @@ def scan_kraken_breakout_universe(lookback_days: int = 7) -> Tuple[List[Dict[str
         if mark_price <= 0:
             continue
 
-        df = get_kraken_daily_klines(kraken_sym, count=lookback_days + 5)
-        metrics = calculate_coin_metrics(df, lookback_days=lookback_days)
+        df = get_kraken_daily_klines(kraken_sym, count=max(40, ema_period + 15))
+        metrics = calculate_coin_metrics(df, lookback_days=lookback_days, ema_period=ema_period)
         if metrics is None:
             continue
 
@@ -257,12 +282,29 @@ def scan_kraken_breakout_universe(lookback_days: int = 7) -> Tuple[List[Dict[str
             "sharpe": metrics["sharpe"],
             "return_7d": metrics["return_7d"],
             "vol_7d": metrics["vol_7d"],
-            "mark_price": mark_price
+            "mark_price": mark_price,
+            "ema20": metrics.get("ema20"),
+            "above_ema20": metrics.get("above_ema20")
         })
 
     # Sort descending by 7-day Sharpe
     results.sort(key=lambda x: x["sharpe"], reverse=True)
-    return results, btc_metrics
+
+    # Compute Aggregate Market Breadth
+    valid_breadth_coins = [c for c in results if c.get("above_ema20") is not None]
+    total_valid = len(valid_breadth_coins)
+    coins_above = sum(1 for c in valid_breadth_coins if c["above_ema20"])
+    breadth_pct = (coins_above / total_valid * 100.0) if total_valid > 0 else 0.0
+
+    breadth_metrics = {
+        "breadth_pct": breadth_pct,
+        "coins_above_ema": coins_above,
+        "total_coins": total_valid,
+        "ema_period": ema_period
+    }
+
+    logger.info(f"Altcoin Breadth: {breadth_pct:.1f}% ({coins_above}/{total_valid} coins above {ema_period}-day EMA)")
+    return results, btc_metrics, breadth_metrics
 
 
 def determine_rebalance(
@@ -362,33 +404,107 @@ def calculate_market_neutral_brackets(
     }
 
 
+def determine_regime(
+    btc_metrics: Dict[str, Any],
+    breadth_metrics: Dict[str, Any],
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Determines market regime:
+      - STATE 1: FLAT / CASH (Defensive: BTC < 50-day EMA)
+      - STATE 2: HEDGED (Selective Bull: BTC > 50-day EMA, Alt Breadth < threshold)
+      - STATE 3: NAKED LONG (Altseason Expansion: BTC > 50-day EMA, Alt Breadth >= threshold)
+    """
+    regime_mode = config.get("regime_mode", "auto").lower()
+    threshold = float(config.get("breadth_expansion_threshold", 50.0))
+    is_btc_bullish = bool(btc_metrics.get("is_bullish", False))
+    breadth_pct = float(breadth_metrics.get("breadth_pct", 0.0))
+
+    if regime_mode == "force_hedged":
+        return {
+            "state": "STATE_2_HEDGED",
+            "name": "🛡️ STATE 2: HEDGED (Manual Override)",
+            "action": "Deploy Market-Neutral Basket (Long Top 3 / Short BTC 0.0% Net Delta).",
+            "execute_short_hedge": True,
+            "breadth_pct": breadth_pct,
+            "threshold": threshold,
+            "btc_bullish": is_btc_bullish
+        }
+    elif regime_mode == "force_naked_long":
+        return {
+            "state": "STATE_3_NAKED_LONG",
+            "name": "🚀 STATE 3: NAKED LONG (Manual Override)",
+            "action": "Deploy Top 3 Longs Unhedged (Full Beta Upside).",
+            "execute_short_hedge": False,
+            "breadth_pct": breadth_pct,
+            "threshold": threshold,
+            "btc_bullish": is_btc_bullish
+        }
+
+    # Auto Regime Detection
+    if not is_btc_bullish:
+        return {
+            "state": "STATE_1_FLAT",
+            "name": "🛑 STATE 1: FLAT / CASH (Defensive)",
+            "action": f"BTC is below 50-day EMA (${btc_metrics.get('ema50', 0):,.0f}). Stay in cash; avoid new longs.",
+            "execute_short_hedge": False,
+            "breadth_pct": breadth_pct,
+            "threshold": threshold,
+            "btc_bullish": is_btc_bullish
+        }
+    elif breadth_pct < threshold:
+        return {
+            "state": "STATE_2_HEDGED",
+            "name": "🛡️ STATE 2: HEDGED (Selective Market)",
+            "action": f"Altcoin Breadth is {breadth_pct:.1f}% (< {threshold:.0f}% threshold). Deploy Long Top 3 + 100% BTC Hedge (0.0% Net Delta).",
+            "execute_short_hedge": True,
+            "breadth_pct": breadth_pct,
+            "threshold": threshold,
+            "btc_bullish": is_btc_bullish
+        }
+    else:
+        return {
+            "state": "STATE_3_NAKED_LONG",
+            "name": "🚀 STATE 3: NAKED LONG (Altseason Expansion)",
+            "action": f"Altcoin Breadth is {breadth_pct:.1f}% (≥ {threshold:.0f}% threshold). Broad participation confirmed! Deploy Top 3 longs UNHEDGED.",
+            "execute_short_hedge": False,
+            "breadth_pct": breadth_pct,
+            "threshold": threshold,
+            "btc_bullish": is_btc_bullish
+        }
+
+
 def format_market_neutral_telegram_alert(
     brackets: Dict[str, Any],
     btc_metrics: Dict[str, Any],
+    breadth_metrics: Dict[str, Any],
+    regime: Dict[str, Any],
     new_entries: List[str],
     exits: List[str],
     config: Dict[str, Any]
 ) -> str:
-    """Formats professional HTML Telegram alert for prop firm traders."""
+    """Formats professional HTML Telegram alert for prop firm traders with dynamic regime analysis."""
     now_utc = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
     acc_size = config["account_size_usd"]
     gross_exp = config["gross_exposure_pct"]
     half_exp = gross_exp / 2.0
 
     lines = [
-        "⚖️ <b>KRAKEN MARKET-NEUTRAL MOMENTUM SCANNER</b>",
+        "⚖️ <b>KRAKEN DYNAMIC REGIME &amp; RS SCANNER</b>",
         f"📅 <code>{now_utc}</code> | Universe: <b>Kraken Breakout (65 Coins)</b>",
         "",
-        "🛡️ <b>PROP-FIRM RISK &amp; DELTA PROFILE:</b>",
-        f"• Account Capital: <code>${acc_size:,.0f}</code>",
-        f"• Gross Portfolio Exposure: <code>{gross_exp:.1f}%</code> (${brackets['total_long_usd'] + brackets['total_short_usd']:,.0f})",
-        f"• Long Leg: <code>+{half_exp:.1f}%</code> (${brackets['total_long_usd']:,.0f}) | Short Leg: <code>-{half_exp:.1f}%</code> (${brackets['total_short_usd']:,.0f})",
-        f"• <b>Net Market Delta:</b> <code>0.0% ($0.00)</code> — <b>IMMUNE TO BTC DUMPS</b>",
-        "",
-        f"👑 <b>BITCOIN HEDGE CONTEXT (PF_XBTUSD):</b>",
-        f"• Live Mark Price: <code>${btc_metrics.get('mark_price', 0):,.2f}</code>",
-        f"• 50-Day EMA: <code>${btc_metrics.get('ema50', 0):,.2f}</code> "
+        "📊 <b>MARKET BREADTH &amp; REGIME ENGINE:</b>",
+        f"• BTC 50-Day EMA: <code>${btc_metrics.get('ema50', 0):,.2f}</code> "
         f"({'🟢 Bullish' if btc_metrics.get('is_bullish') else '🔴 Bearish'})",
+        f"• <b>Altcoin Breadth (>20 EMA):</b> <code>{breadth_metrics.get('breadth_pct', 0.0):.1f}%</code> "
+        f"({breadth_metrics.get('coins_above_ema', 0)} / {breadth_metrics.get('total_coins', 0)} coins)",
+        f"• <b>Active Regime:</b> {regime['name']}",
+        f"• <b>Recommendation:</b> {regime['action']}",
+        "",
+        "🛡️ <b>PROP-FIRM CAPITAL PROFILE:</b>",
+        f"• Account Capital: <code>${acc_size:,.0f}</code>",
+        f"• Hedged Gross Exposure: <code>{gross_exp:.1f}%</code> (${brackets['total_long_usd'] + brackets['total_short_usd']:,.0f}) | Net Delta: <code>0.0% ($0.00)</code>",
+        f"• Unhedged Long Exposure (if Naked): <code>{half_exp:.1f}%</code> (${brackets['total_long_usd']:,.0f})",
         "",
         f"🟢 <b>LONG ALPHA LEG (TOP {config['top_k']} RS LEADERS):</b>"
     ]
@@ -406,7 +522,7 @@ def format_market_neutral_telegram_alert(
     sh = brackets["short_hedge"]
     lines.extend([
         "",
-        f"🔴 <b>SHORT HEDGE LEG (PF_XBTUSD):</b>",
+        f"🔴 <b>SHORT HEDGE LEG (PF_XBTUSD - Deploy if in Hedged Mode):</b>",
         f"• Contract: <code>{sh['symbol']}</code>",
         f"• Short Size: <code>${sh['target_usd']:,.0f}</code> (~<code>{sh['target_units']:.4f}</code> BTC)",
         f"• Mark Price: <code>${sh['mark_price']:,.2f}</code>",
@@ -425,7 +541,10 @@ def format_market_neutral_telegram_alert(
 
     lines.extend([
         "",
-        "💡 <i>Prop Rule Safety: Maximum historical single-day drawdown is capped &lt; 2.0%, fully compliant with the 4.0% daily trailing limit.</i>"
+        "💡 <i>Regime Execution Directives:</i>",
+        "• <b>STATE 1 (Flat):</b> Stay in cash. Close open long risk.",
+        "• <b>STATE 2 (Hedged):</b> Execute Longs + Short BTC. Maximum 1-day drawdown &lt; 2.0% (immune to 4.0% daily limit).",
+        "• <b>STATE 3 (Naked Long):</b> Execute Longs only (skip Short BTC) to maximize speed to 8%-10% prop target."
     ])
 
     return "\n".join(lines)
@@ -445,10 +564,15 @@ def run_scanner():
         except Exception as e:
             logger.warning(f"Could not load state file {state_file}: {e}")
 
-    scored_coins, btc_metrics = scan_kraken_breakout_universe(lookback_days=config["lookback_days"])
+    scored_coins, btc_metrics, breadth_metrics = scan_kraken_breakout_universe(
+        lookback_days=config["lookback_days"],
+        ema_period=config["breadth_ema_period"]
+    )
     if not scored_coins:
         logger.error("No coins successfully scored. Exiting scan.")
         return
+
+    regime = determine_regime(btc_metrics, breadth_metrics, config)
 
     top_coins, new_entries, exits = determine_rebalance(
         scored_coins,
@@ -462,10 +586,15 @@ def run_scanner():
     # Update state file
     new_state = {
         "timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        "regime_state": regime["state"],
+        "regime_name": regime["name"],
+        "altcoin_breadth_pct": breadth_metrics["breadth_pct"],
+        "coins_above_ema20": breadth_metrics["coins_above_ema"],
+        "total_coins_scanned": breadth_metrics["total_coins"],
         "active_longs": [c["coin"] for c in top_coins],
         "short_hedge": "PF_XBTUSD",
         "gross_exposure_pct": config["gross_exposure_pct"],
-        "net_market_delta_pct": 0.0
+        "net_market_delta_pct": 0.0 if regime["execute_short_hedge"] else (config["gross_exposure_pct"] / 2.0)
     }
     try:
         with open(state_file, "w", encoding="utf-8") as f:
@@ -475,7 +604,9 @@ def run_scanner():
         logger.error(f"Failed to write state file {state_file}: {e}")
 
     # Build and send Telegram message
-    message = format_market_neutral_telegram_alert(brackets, btc_metrics, new_entries, exits, config)
+    message = format_market_neutral_telegram_alert(
+        brackets, btc_metrics, breadth_metrics, regime, new_entries, exits, config
+    )
     print("\n" + "=" * 80)
     print(message.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "").replace("<i>", "").replace("</i>", ""))
     print("=" * 80 + "\n")

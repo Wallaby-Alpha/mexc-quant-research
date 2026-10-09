@@ -103,10 +103,48 @@ def test_telegram_alert_generation():
         }
     }
     btc_metrics = {"mark_price": 80000.0, "ema50": 76000.0, "is_bullish": True}
+    breadth_metrics = {"breadth_pct": 45.0, "coins_above_ema": 27, "total_coins": 60, "ema_period": 20}
+    regime = {
+        "state": "STATE_2_HEDGED",
+        "name": "🛡️ STATE 2: HEDGED (Selective Market)",
+        "action": "Deploy Long Top 3 + 100% BTC Hedge.",
+        "execute_short_hedge": True
+    }
     
-    msg = format_market_neutral_telegram_alert(brackets, btc_metrics, ["SOL"], [], config)
-    assert "Net Market Delta:" in msg
-    assert "0.0% ($0.00)" in msg
+    msg = format_market_neutral_telegram_alert(brackets, btc_metrics, breadth_metrics, regime, ["SOL"], [], config)
+    assert "MARKET BREADTH" in msg
+    assert "Altcoin Breadth (>20 EMA):</b> <code>45.0%</code>" in msg
+    assert "STATE 2: HEDGED" in msg
     assert "PF_SOLUSD" in msg
     assert "PF_XBTUSD" in msg
     assert "NEW BUYS:</b> SOL" in msg
+
+
+def test_determine_regime_states():
+    from scanner.kraken_market_neutral_scanner import determine_regime
+    config = {"breadth_expansion_threshold": 50.0, "regime_mode": "auto"}
+
+    # 1. State 1: Flat when BTC < 50 EMA
+    btc_bearish = {"mark_price": 70000.0, "ema50": 75000.0, "is_bullish": False}
+    breadth_high = {"breadth_pct": 70.0, "coins_above_ema": 42, "total_coins": 60}
+    r1 = determine_regime(btc_bearish, breadth_high, config)
+    assert r1["state"] == "STATE_1_FLAT"
+    assert r1["execute_short_hedge"] is False
+
+    # 2. State 2: Hedged when BTC > 50 EMA and Breadth < 50%
+    btc_bullish = {"mark_price": 80000.0, "ema50": 75000.0, "is_bullish": True}
+    breadth_low = {"breadth_pct": 40.0, "coins_above_ema": 24, "total_coins": 60}
+    r2 = determine_regime(btc_bullish, breadth_low, config)
+    assert r2["state"] == "STATE_2_HEDGED"
+    assert r2["execute_short_hedge"] is True
+
+    # 3. State 3: Naked Long when BTC > 50 EMA and Breadth >= 50%
+    r3 = determine_regime(btc_bullish, breadth_high, config)
+    assert r3["state"] == "STATE_3_NAKED_LONG"
+    assert r3["execute_short_hedge"] is False
+
+    # 4. Overrides
+    cfg_override = {"regime_mode": "force_naked_long"}
+    r4 = determine_regime(btc_bearish, breadth_low, cfg_override)
+    assert r4["state"] == "STATE_3_NAKED_LONG"
+
