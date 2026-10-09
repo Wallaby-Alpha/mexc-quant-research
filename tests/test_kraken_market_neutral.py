@@ -113,7 +113,7 @@ def test_telegram_alert_generation():
     
     msg = format_market_neutral_telegram_alert(brackets, btc_metrics, breadth_metrics, regime, ["SOL"], [], config)
     assert "MARKET BREADTH" in msg
-    assert "Altcoin Breadth (>20 EMA):</b> <code>45.0%</code>" in msg
+    assert "Altcoin Breadth (Above 20 EMA):</b> <code>45.0%</code>" in msg
     assert "STATE 2: HEDGED" in msg
     assert "PF_SOLUSD" in msg
     assert "PF_XBTUSD" in msg

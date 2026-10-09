@@ -124,7 +124,7 @@ def load_config() -> Dict[str, Any]:
 
 
 def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
-    """Dispatches formatted message to Telegram Bot with auto-chunking."""
+    """Dispatches formatted message to Telegram Bot with auto-chunking and HTML parse fallback."""
     if not token or not chat_id:
         logger.warning("Telegram token or chat_id not configured. Printing message to stdout only.")
         return False
@@ -133,27 +133,59 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
     max_len = 3800
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)]
 
-    success = True
+    all_delivered = True
     for i, chunk in enumerate(chunks):
+        delivered = False
         payload = {
             "chat_id": chat_id,
             "text": chunk,
             "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 resp = requests.post(url, json=payload, timeout=12)
                 if resp.status_code == 200:
+                    delivered = True
+                    logger.info("Successfully delivered alert to Telegram.")
                     break
                 else:
-                    time.sleep(1)
-            except Exception:
+                    logger.warning(f"Telegram HTML send attempt {attempt+1} failed ({resp.status_code}): {resp.text}")
+                    # If HTML parsing fails, fallback immediately to plain text
+                    plain_text = (
+                        chunk.replace("<b>", "")
+                        .replace("</b>", "")
+                        .replace("<code>", "")
+                        .replace("</code>", "")
+                        .replace("<i>", "")
+                        .replace("</i>", "")
+                        .replace("&amp;", "&")
+                        .replace("&lt;", "<")
+                        .replace("&gt;", ">")
+                    )
+                    plain_payload = {
+                        "chat_id": chat_id,
+                        "text": plain_text,
+                        "disable_web_page_preview": True
+                    }
+                    fallback_resp = requests.post(url, json=plain_payload, timeout=12)
+                    if fallback_resp.status_code == 200:
+                        delivered = True
+                        logger.info("Successfully delivered fallback plain-text alert to Telegram.")
+                        break
+                    else:
+                        logger.error(f"Telegram plain-text send failed ({fallback_resp.status_code}): {fallback_resp.text}")
+            except Exception as e:
+                logger.error(f"Error connecting to Telegram API: {e}")
                 time.sleep(1)
+
+        if not delivered:
+            all_delivered = False
         if len(chunks) > 1 and i < len(chunks) - 1:
             time.sleep(0.5)
 
-    return success
+    return all_delivered
+
 
 
 def get_kraken_live_tickers() -> Dict[str, Dict[str, Any]]:
@@ -456,7 +488,7 @@ def determine_regime(
         return {
             "state": "STATE_2_HEDGED",
             "name": "🛡️ STATE 2: HEDGED (Selective Market)",
-            "action": f"Altcoin Breadth is {breadth_pct:.1f}% (< {threshold:.0f}% threshold). Deploy Long Top 3 + 100% BTC Hedge (0.0% Net Delta).",
+            "action": f"Altcoin Breadth is {breadth_pct:.1f}% (under {threshold:.0f}% threshold). Deploy Long Top 3 + 100% BTC Hedge (0.0% Net Delta).",
             "execute_short_hedge": True,
             "breadth_pct": breadth_pct,
             "threshold": threshold,
@@ -466,7 +498,7 @@ def determine_regime(
         return {
             "state": "STATE_3_NAKED_LONG",
             "name": "🚀 STATE 3: NAKED LONG (Altseason Expansion)",
-            "action": f"Altcoin Breadth is {breadth_pct:.1f}% (≥ {threshold:.0f}% threshold). Broad participation confirmed! Deploy Top 3 longs UNHEDGED.",
+            "action": f"Altcoin Breadth is {breadth_pct:.1f}% (at or above {threshold:.0f}% threshold). Broad participation confirmed! Deploy Top 3 longs UNHEDGED.",
             "execute_short_hedge": False,
             "breadth_pct": breadth_pct,
             "threshold": threshold,
@@ -496,7 +528,7 @@ def format_market_neutral_telegram_alert(
         "📊 <b>MARKET BREADTH &amp; REGIME ENGINE:</b>",
         f"• BTC 50-Day EMA: <code>${btc_metrics.get('ema50', 0):,.2f}</code> "
         f"({'🟢 Bullish' if btc_metrics.get('is_bullish') else '🔴 Bearish'})",
-        f"• <b>Altcoin Breadth (>20 EMA):</b> <code>{breadth_metrics.get('breadth_pct', 0.0):.1f}%</code> "
+        f"• <b>Altcoin Breadth (Above 20 EMA):</b> <code>{breadth_metrics.get('breadth_pct', 0.0):.1f}%</code> "
         f"({breadth_metrics.get('coins_above_ema', 0)} / {breadth_metrics.get('total_coins', 0)} coins)",
         f"• <b>Active Regime:</b> {regime['name']}",
         f"• <b>Recommendation:</b> {regime['action']}",
