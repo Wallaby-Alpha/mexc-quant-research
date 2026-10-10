@@ -7,16 +7,18 @@ Targets: Top 100 Crypto Contracts by Volume (WEEX Contract V3 API).
 Core Strategy Logic:
 1. Higher Timeframe (1h): Detects confirmed Order Blocks (last down-close before BOS breakout).
 2. Lower Timeframe (15m): Detects Liquidity Sweeps (penetrates OB by >= 0.05% and closes back inside).
-3. Risk Management:
+3. Risk Management & Execution:
+   - Dynamic Precision Engine: Formats quantity and prices strictly to WEEX exchangeInfo specs
+     (contractVal, minOrderSize, quantityPrecision, pricePrecision).
    - Stop Loss: 1x ATR(14) below the sweep low.
    - Take Profit: Equal highs or 2.5R.
    - Native Exchange Brackets: Submits preset SL & TP directly to WEEX matching engine.
 4. Operational Features:
    - Dynamic Top 100 Universe Scanner via WEEX V3 Contract API (/capi/v3/market/ticker/24hr).
    - Real-time V3 K-line fetching (/capi/v3/market/klines).
-   - Dry-Run Simulation Mode (enabled by default for safety).
+   - Real-time Account Balance and Margin validation (/capi/v3/account/balance).
+   - Accurate Alerting: Distinguishes between Success, Dry-Run, and Exchange Rejections.
    - Interactive Diagnostics & Health Check CLI flag (--diagnostics).
-   - Instant Telegram alerts with clickable bracket levels.
    - Automatic 15-minute synchronization loop (:00, :15, :30, :45 UTC).
 """
 
@@ -120,6 +122,8 @@ class WeexClient:
         self.secret_key = secret_key
         self.passphrase = passphrase
         self.dry_run = dry_run
+        self.exchange_info: Dict[str, Dict[str, Any]] = {}
+        self.refresh_exchange_info()
 
     def _generate_signature(self, timestamp: str, method: str, path: str, query: str = "", body: str = "") -> str:
         """Constructs HMAC SHA256 base64 signature per WEEX documentation."""
@@ -137,6 +141,82 @@ class WeexClient:
             "ACCESS-PASSPHRASE": self.passphrase,
             "Content-Type": "application/json"
         }
+
+    def refresh_exchange_info(self):
+        """Fetches and caches symbol trading rules (precisions, lot sizes, min quantities)."""
+        url = f"{self.base_url}/capi/v3/market/exchangeInfo"
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                symbols = r.json().get("symbols", [])
+                meta = {}
+                for s in symbols:
+                    sym = s.get("symbol", "")
+                    meta[sym] = {
+                        "pricePrecision": int(s.get("pricePrecision", 4)),
+                        "quantityPrecision": int(s.get("quantityPrecision", 2)),
+                        "contractVal": float(s.get("contractVal", 1.0)),
+                        "minOrderSize": float(s.get("minOrderSize", 1.0)),
+                        "maxOrderSize": float(s.get("maxOrderSize", 100000000.0)),
+                    }
+                self.exchange_info = meta
+                logger.info(f"Loaded exchange trading specifications for {len(self.exchange_info)} symbols.")
+        except Exception as e:
+            logger.warning(f"Failed to fetch exchangeInfo: {e}")
+
+    def format_order_values(
+        self, symbol: str, raw_qty: float, entry_p: float, sl_p: float, tp_p: float
+    ) -> Tuple[str, str, str, str]:
+        """
+        Formats quantity and price strictly to WEEX contract specifications:
+        - Quantities are rounded down to nearest contractVal / minOrderSize lot multiple.
+        - Prices are formatted to the exact pricePrecision decimals.
+        """
+        info = self.exchange_info.get(symbol, {
+            "pricePrecision": 4,
+            "quantityPrecision": 2,
+            "contractVal": 1.0,
+            "minOrderSize": 0.0001
+        })
+
+        c_val = info.get("contractVal", 1.0)
+        min_size = info.get("minOrderSize", 0.0001)
+        step = c_val if c_val > 0 else min_size
+
+        if step > 0:
+            lots = int(raw_qty / step)
+            qty = lots * step
+        else:
+            qty = raw_qty
+
+        if qty < min_size:
+            formatted_qty = "0"
+        elif info.get("quantityPrecision", 2) > 0:
+            formatted_qty = f"{qty:.{info['quantityPrecision']}f}"
+        else:
+            formatted_qty = str(int(qty))
+
+        p_prec = info.get("pricePrecision", 4)
+        formatted_entry = f"{entry_p:.{p_prec}f}"
+        formatted_sl = f"{sl_p:.{p_prec}f}"
+        formatted_tp = f"{tp_p:.{p_prec}f}"
+
+        return formatted_qty, formatted_entry, formatted_sl, formatted_tp
+
+    def get_account_balance(self) -> Dict[str, Any]:
+        """Fetches account USDT available margin and equity."""
+        if not self.api_key:
+            return {}
+        path = "/capi/v3/account/balance"
+        try:
+            headers = self._get_headers("GET", path)
+            r = requests.get(f"{self.base_url}{path}", headers=headers, timeout=10)
+            if r.status_code == 200:
+                res = r.json()
+                return res.get("data", {}) if isinstance(res, dict) else {}
+        except Exception as e:
+            logger.warning(f"Could not fetch account balance: {e}")
+        return {}
 
     def get_top_contracts_by_volume(self, top_n: int = 100) -> List[str]:
         """Fetches all active USDT perpetuals and ranks by 24h quote turnover via V3 API."""
@@ -216,16 +296,37 @@ class WeexClient:
         symbol: str,
         side: str,
         position_side: str,
-        quantity: float,
-        sl_price: float,
-        tp_price: float
+        raw_quantity: float = 0.0,
+        entry_price: float = 0.0,
+        sl_price: float = 0.0,
+        tp_price: float = 0.0,
+        quantity: Optional[float] = None
     ) -> Dict[str, Any]:
         """
         Submits market order with native preset TP & SL attached directly to WEEX engine.
+        Quantity and prices are formatted to match symbol exchange rules.
         """
+        if quantity is not None and raw_quantity == 0.0:
+            raw_quantity = quantity
+
+        qty_str, entry_str, sl_str, tp_str = self.format_order_values(
+            symbol, raw_quantity, entry_price, sl_price, tp_price
+        )
+
+        if qty_str == "0":
+            err_msg = f"Quantity {raw_quantity:.4f} is below minimum allowed size for {symbol}"
+            logger.error(f"❌ Order Aborted: {err_msg}")
+            return {"status": "error", "error": {"msg": err_msg, "code": "MIN_SIZE_VIOLATION"}}
+
         if self.dry_run:
-            logger.info(f"[DRY-RUN SIMULATION] {side} {position_side} {quantity} {symbol} | SL: {sl_price:.4f} | TP: {tp_price:.4f}")
-            return {"status": "simulated", "orderId": "sim_123456"}
+            logger.info(f"[DRY-RUN SIMULATION] {side} {position_side} {qty_str} {symbol} | Entry: {entry_str} | SL: {sl_str} | TP: {tp_str}")
+            return {
+                "status": "simulated",
+                "orderId": f"sim_{int(time.time()*1000)}",
+                "formatted_qty": qty_str,
+                "formatted_sl": sl_str,
+                "formatted_tp": tp_str
+            }
 
         path = "/capi/v3/order"
         payload = {
@@ -233,23 +334,33 @@ class WeexClient:
             "side": side.upper(),                 # "BUY" or "SELL"
             "positionSide": position_side.upper(), # "LONG" or "SHORT"
             "type": "MARKET",
-            "quantity": str(round(quantity, 4)),
-            "slTriggerPrice": str(round(sl_price, 4)),
-            "tpTriggerPrice": str(round(tp_price, 4)),
+            "quantity": qty_str,
+            "slTriggerPrice": sl_str,
+            "tpTriggerPrice": tp_str,
             "SlWorkingType": "MARK_PRICE",
-            "TpWorkingType": "MARK_PRICE"
+            "TpWorkingType": "MARK_PRICE",
+            "newClientOrderId": f"ob_{int(time.time()*1000)}"
         }
         body_str = json.dumps(payload)
         headers = self._get_headers("POST", path, body=body_str)
 
+        logger.info(f"Submitting WEEX V3 Contract Order: {payload}")
+
         try:
-            r = requests.post(f"{self.base_url}{path}", headers=headers, data=body_str, timeout=10)
+            r = requests.post(f"{self.base_url}{path}", headers=headers, data=body_str, timeout=12)
             res = r.json()
             if r.status_code == 200 and res.get("code") == "00000":
-                logger.info(f"✅ Live WEEX Order Placed: {symbol} {side} | Response: {res}")
-                return {"status": "success", "data": res.get("data")}
+                logger.info(f"✅ Live WEEX Order Placed Successfully: {symbol} {side} | Response: {res}")
+                return {
+                    "status": "success",
+                    "orderId": res.get("data", {}).get("orderId", "N/A"),
+                    "data": res.get("data"),
+                    "formatted_qty": qty_str,
+                    "formatted_sl": sl_str,
+                    "formatted_tp": tp_str
+                }
             else:
-                logger.error(f"❌ WEEX Order Failed: {r.status_code} {res}")
+                logger.error(f"❌ WEEX Order Rejected by Exchange: HTTP {r.status_code} | Body: {res}")
                 return {"status": "error", "error": res}
         except Exception as e:
             logger.error(f"Exception submitting WEEX order: {e}")
@@ -452,13 +563,18 @@ def run_diagnostics(client: WeexClient, config: Dict[str, Any]):
     else:
         print("  ❌ ERROR: Failed to retrieve 1h/15m klines.")
 
-    # 3. Authenticated Credentials Check
-    print("\n[3/5] Testing Private WEEX API Credentials...")
+    # 3. Authenticated Credentials & Balance Check
+    print("\n[3/5] Testing Private WEEX API Credentials & Account Balance...")
     if not client.api_key or not client.secret_key or not client.passphrase:
         print("  ⚠️ INFO: API credentials not provided (Dry-Run Only mode).")
     else:
         pos_cnt = client.get_open_positions_count()
+        bal = client.get_account_balance()
         print(f"  ✅ SUCCESS: Private API authenticated! Active Open Positions: {pos_cnt}")
+        if bal:
+            avail = float(bal.get("available", 0.0) or bal.get("crossMargin", 0.0) or 0.0)
+            equity = float(bal.get("equity", 0.0) or bal.get("total", 0.0) or 0.0)
+            print(f"  💰 Account Balance: Available Margin=${avail:,.2f} | Total Equity=${equity:,.2f}")
 
     # 4. Telegram Alert Test
     print("\n[4/5] Testing Telegram Notification Connection...")
@@ -530,35 +646,73 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
 
         # Calculate position size based on risk_per_trade_usd
         risk_amount = config["risk_per_trade_usd"]
-        quantity = risk_amount / risk_dist if risk_dist > 0 else 0.0
+        raw_quantity = risk_amount / risk_dist if risk_dist > 0 else 0.0
 
-        if quantity <= 0:
+        if raw_quantity <= 0:
             continue
 
-        # Place Native Bracket Order on WEEX
+        # Place Native Bracket Order on WEEX with lot-precision formatting
         result = client.place_native_bracket_order(
             symbol=sym,
             side=sig["side"],
             position_side=sig["position_side"],
-            quantity=quantity,
+            raw_quantity=raw_quantity,
+            entry_price=entry,
             sl_price=sl,
             tp_price=tp
         )
 
-        active_positions += 1
+        status = result.get("status")
+        formatted_qty = result.get("formatted_qty", str(raw_quantity))
+        formatted_sl = result.get("formatted_sl", str(sl))
+        formatted_tp = result.get("formatted_tp", str(tp))
 
-        # Dispatch Telegram Alert
-        prefix = "🚨 [DRY-RUN SIMULATION]" if config["dry_run"] else "⚡ [LIVE ORDER EXECUTED]"
-        msg = (
-            f"<b>{prefix} SMC ORDER BLOCK SWEEP!</b>\n"
-            f"• Contract: <code>{sym}</code> ({sig['direction'].upper()})\n"
-            f"• Entry: <code>${entry:,.4f}</code>\n"
-            f"• <b>Native Exchange SL:</b> <code>${sl:,.4f}</code> (-1x ATR)\n"
-            f"• <b>Native Exchange TP:</b> <code>${tp:,.4f}</code> (+2.5R)\n"
-            f"• Position Size: <code>{quantity:,.2f}</code> units (${risk_amount:,.0f} risk)\n"
-            f"• Active Positions: <code>{active_positions}/{max_pos}</code>"
-        )
-        send_telegram(config["telegram_bot_token"], config["telegram_chat_id"], msg)
+        # 1. LIVE ORDER FILLED
+        if status == "success":
+            active_positions += 1
+            order_id = result.get("orderId", "N/A")
+            msg = (
+                f"⚡ <b>[LIVE ORDER EXECUTED] SMC ORDER BLOCK SWEEP!</b>\n"
+                f"• Contract: <code>{sym}</code> ({sig['direction'].upper()})\n"
+                f"• Entry: <code>${entry:,.4f}</code>\n"
+                f"• <b>Native Exchange SL:</b> <code>${formatted_sl}</code> (-1x ATR)\n"
+                f"• <b>Native Exchange TP:</b> <code>${formatted_tp}</code> (+2.5R)\n"
+                f"• Position Size: <code>{formatted_qty}</code> units (${risk_amount:,.0f} risk)\n"
+                f"• Order ID: <code>{order_id}</code>\n"
+                f"• Active Positions: <code>{active_positions}/{max_pos}</code>"
+            )
+            send_telegram(config["telegram_bot_token"], config["telegram_chat_id"], msg)
+
+        # 2. DRY-RUN SIMULATION
+        elif status == "simulated":
+            active_positions += 1
+            msg = (
+                f"🚨 <b>[DRY-RUN SIMULATION] SMC ORDER BLOCK SWEEP!</b>\n"
+                f"• Contract: <code>{sym}</code> ({sig['direction'].upper()})\n"
+                f"• Entry: <code>${entry:,.4f}</code>\n"
+                f"• <b>Simulated SL:</b> <code>${formatted_sl}</code> (-1x ATR)\n"
+                f"• <b>Simulated TP:</b> <code>${formatted_tp}</code> (+2.5R)\n"
+                f"• Position Size: <code>{formatted_qty}</code> units (${risk_amount:,.0f} risk)\n"
+                f"• Active Positions: <code>{active_positions}/{max_pos}</code>"
+            )
+            send_telegram(config["telegram_bot_token"], config["telegram_chat_id"], msg)
+
+        # 3. ORDER REJECTED BY EXCHANGE
+        else:
+            err = result.get("error", "Unknown error")
+            err_msg = err.get("msg", str(err)) if isinstance(err, dict) else str(err)
+            err_code = err.get("code", "") if isinstance(err, dict) else ""
+            logger.error(f"Order rejected for {sym}: Code {err_code} - {err_msg}")
+            fail_msg = (
+                f"⚠️ <b>[WEEX ORDER REJECTED] {sym} ({sig['direction'].upper()})</b>\n"
+                f"• Error Code: <code>{err_code}</code>\n"
+                f"• Reason: <code>{err_msg}</code>\n"
+                f"• Attempted Size: <code>{formatted_qty}</code> units\n"
+                f"• SL: <code>${formatted_sl}</code> | TP: <code>${formatted_tp}</code>\n"
+                f"• <i>No position opened on exchange.</i>"
+            )
+            send_telegram(config["telegram_bot_token"], config["telegram_chat_id"], fail_msg)
+
         time.sleep(0.5)
 
 
@@ -597,9 +751,10 @@ def start_bot_daemon():
 
     while True:
         try:
-            # Refresh universe daily
+            # Refresh universe & trading specifications daily
             if time.time() - last_universe_refresh > 86400:
                 universe = client.get_top_contracts_by_volume(top_n=config["top_universe_count"])
+                client.refresh_exchange_info()
                 last_universe_refresh = time.time()
 
             # Execute Scan Cycle
