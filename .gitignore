@@ -20,6 +20,9 @@ results/trades.csv
 # Credentials & Sensitive Configs
 scanner_config.json
 kraken_breakout_config.json
+weex_bot_config.json
+*weex*_config.json
+!*example*.json
 .env
 *.pem
 *.key
