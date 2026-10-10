@@ -20,6 +20,7 @@ results/trades.csv
 # Credentials & Sensitive Configs
 scanner_config.json
 kraken_breakout_config.json
+kraken_market_neutral_config.json
 weex_bot_config.json
 *weex*_config.json
 !*example*.json
@@ -29,6 +30,8 @@ weex_bot_config.json
 
 # Local Runtime & Portfolio State
 portfolio_state.json
+portfolio_state_market_neutral.json
+portfolio_state_daily.json
 kraken_breakout_state.json
 *.log
 scanner.log
