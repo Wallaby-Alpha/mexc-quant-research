@@ -11,3 +11,4 @@ Per Non-Negotiable Rule 4: *"Log every assumption you do make in docs/ASSUMPTION
 | A-005 | 2026-09-29 | Holdout | First 75% (270 days) is In-Sample; final 25% (90 days) is Locked Holdout | Mandatory Holdout Discipline (Rule 5) | Proposed for Phase 0 approval |
 | A-006 | 2026-09-29 | Execution | Base taker fee 0.02%, maker fee 0.00% | Current published MEXC futures fee schedule | MEXC official fee documentation |
 | A-007 | 2026-09-29 | Ambiguity | Same-bar collisions of stop and target default to stop-first | Conservative evaluation policy (DEFINITIONS.md §11) | Defined in project specifications |
+| A-008 | 2026-10-09 | Strategy / ICT | Scaled 5m/1m to 1h/15m on existing dataset; prior day 70% range filter operationalized as middle equilibrium zone (15%-85%); roundtrip costs set to 0.16% (0.06% taker + 2 bps slippage per leg). | Enables zero-lookahead testing across 100 liquid coins; aligns with realistic prop firm fee friction. | User choice Option 1 |
