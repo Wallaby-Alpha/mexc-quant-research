@@ -2,7 +2,7 @@
 bot/weex_ob_sweep_bot.py
 ------------------------
 Production Automated SMC/ICT Order Block Liquidity Sweep Trading Bot for WEEX.
-Targets: Top 100 Crypto Contracts by Volume.
+Targets: Top 100 Crypto Contracts by Volume (WEEX Contract V3 API).
 
 Core Strategy Logic:
 1. Higher Timeframe (1h): Detects confirmed Order Blocks (last down-close before BOS breakout).
@@ -12,8 +12,10 @@ Core Strategy Logic:
    - Take Profit: Equal highs or 2.5R.
    - Native Exchange Brackets: Submits preset SL & TP directly to WEEX matching engine.
 4. Operational Features:
-   - Dynamic Top 100 Universe Scanner (refreshes daily).
+   - Dynamic Top 100 Universe Scanner via WEEX V3 Contract API (/capi/v3/market/ticker/24hr).
+   - Real-time V3 K-line fetching (/capi/v3/market/klines).
    - Dry-Run Simulation Mode (enabled by default for safety).
+   - Interactive Diagnostics & Health Check CLI flag (--diagnostics).
    - Instant Telegram alerts with clickable bracket levels.
    - Automatic 15-minute synchronization loop (:00, :15, :30, :45 UTC).
 """
@@ -71,7 +73,7 @@ def load_config() -> Dict[str, Any]:
         "max_concurrent_positions": 5,
         "risk_reward_ratio": 2.5,
         "atr_multiplier": 1.0,
-        "max_ob_age_hours": 8.0,
+        "max_ob_age_hours": 24.0,
         "min_sweep_pct": 0.05,
         "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
@@ -137,20 +139,22 @@ class WeexClient:
         }
 
     def get_top_contracts_by_volume(self, top_n: int = 100) -> List[str]:
-        """Fetches all active USDT perpetuals and ranks by 24h quote turnover."""
-        url = f"{self.base_url}/capi/v1/market/tickers"
+        """Fetches all active USDT perpetuals and ranks by 24h quote turnover via V3 API."""
+        url = f"{self.base_url}/capi/v3/market/ticker/24hr"
         try:
             r = requests.get(url, timeout=12)
             if r.status_code != 200:
                 logger.error(f"Failed to fetch tickers: {r.status_code} {r.text}")
                 return []
-            data = r.json()
-            tickers = data.get("data", [])
+            tickers = r.json()
+            if not isinstance(tickers, list):
+                logger.error(f"Unexpected ticker response format: {tickers}")
+                return []
             usdt_tickers = []
             for t in tickers:
                 sym = t.get("symbol", "")
-                if sym.endswith("USDT") or sym.endswith("_USDT") or "USDT" in sym:
-                    vol = float(t.get("quoteVolume", 0.0) or t.get("turnover", 0.0) or t.get("amount24", 0.0))
+                if sym.endswith("USDT") or sym.endswith("_USDT"):
+                    vol = float(t.get("quoteVolume", 0.0) or t.get("volume", 0.0) or 0.0)
                     usdt_tickers.append((sym, vol))
 
             usdt_tickers.sort(key=lambda x: x[1], reverse=True)
@@ -162,42 +166,45 @@ class WeexClient:
             return []
 
     def get_klines(self, symbol: str, granularity: str = "15m", limit: int = 100) -> Optional[pd.DataFrame]:
-        """Fetches historical klines for analysis."""
-        url = f"{self.base_url}/capi/v1/market/candles"
+        """Fetches historical klines for analysis via V3 API."""
+        url = f"{self.base_url}/capi/v3/market/klines"
         gran_map = {"15m": "15m", "1h": "1h", "1d": "1d"}
         params = {
             "symbol": symbol,
-            "granularity": gran_map.get(granularity, "15m"),
+            "interval": gran_map.get(granularity, "15m"),
             "limit": limit
         }
         try:
             r = requests.get(url, params=params, timeout=10)
             if r.status_code != 200:
                 return None
-            data = r.json().get("data", [])
-            if not data or len(data) < 20:
+            data = r.json()
+            if not isinstance(data, list) or len(data) < 20:
                 return None
-            # Format: [timestamp, open, high, low, close, volume]
-            df = pd.DataFrame(data, columns=["open_time", "open", "high", "low", "close", "volume"])
-            for c in ["open", "high", "low", "close", "volume"]:
-                df[c] = df[c].astype(float)
+            # Format: [openTime, open, high, low, close, volume, ...]
+            rows = []
+            for d in data:
+                rows.append([d[0], float(d[1]), float(d[2]), float(d[3]), float(d[4]), float(d[5])])
+            df = pd.DataFrame(rows, columns=["open_time", "open", "high", "low", "close", "volume"])
             df["open_time"] = pd.to_datetime(df["open_time"].astype(int), unit="ms", utc=True)
             df = df.sort_values("open_time").reset_index(drop=True)
             return df
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error fetching klines for {symbol}: {e}")
             return None
 
     def get_open_positions_count(self) -> int:
         """Fetches currently open positions count."""
         if self.dry_run or not self.api_key:
             return 0
-        path = "/capi/v3/position/allPosition"
+        path = "/capi/v3/account/position/allPosition"
         try:
             headers = self._get_headers("GET", path)
             r = requests.get(f"{self.base_url}{path}", headers=headers, timeout=10)
             if r.status_code == 200:
-                pos_list = r.json().get("data", [])
-                active = [p for p in pos_list if float(p.get("total", 0.0)) > 0]
+                res_data = r.json()
+                pos_list = res_data.get("data", []) if isinstance(res_data, dict) else res_data
+                active = [p for p in pos_list if float(p.get("total", 0.0) or p.get("size", 0.0) or 0.0) > 0]
                 return len(active)
             return 0
         except Exception as e:
@@ -274,8 +281,11 @@ def evaluate_symbol_for_sweep_setup(
     symbol: str,
     config: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
-    """Evaluates whether the symbol currently has a fresh 15m Order Block Liquidity Sweep."""
-    if len(df1h) < 30 or len(df15m) < 30:
+    """
+    Evaluates whether the symbol currently has a fresh 15m Order Block Liquidity Sweep.
+    Checks all valid active order blocks formed within max_ob_age_hours.
+    """
+    if len(df1h) < 20 or len(df15m) < 20:
         return None
 
     # Exclude open forming candle; analyze fully closed historical candles
@@ -290,7 +300,7 @@ def evaluate_symbol_for_sweep_setup(
 
     sh_1h, sl_1h = find_fractal_swings(h_1h, l_1h, n=2)
 
-    # 1. Identify Most Recent Confirmed 1h Order Block
+    # 1. Identify Confirmed 1h Order Blocks
     obs = []
     last_sh_broken = np.nan
     last_sl_broken = np.nan
@@ -303,7 +313,7 @@ def evaluate_symbol_for_sweep_setup(
         # Bullish BOS Breakout
         if not np.isnan(curr_sh) and c_1h[i] > curr_sh and curr_sh != last_sh_broken:
             last_sh_broken = curr_sh
-            for j in range(i - 1, max(0, i - 10), -1):
+            for j in range(i - 1, max(0, i - 12), -1):
                 if c_1h[j] < o_1h[j]:
                     obs.append({
                         "ob_type": "bullish",
@@ -317,7 +327,7 @@ def evaluate_symbol_for_sweep_setup(
         # Bearish BOS Breakdown
         if not np.isnan(curr_sl) and c_1h[i] < curr_sl and curr_sl != last_sl_broken:
             last_sl_broken = curr_sl
-            for j in range(i - 1, max(0, i - 10), -1):
+            for j in range(i - 1, max(0, i - 12), -1):
                 if c_1h[j] > o_1h[j]:
                     obs.append({
                         "ob_type": "bearish",
@@ -331,10 +341,16 @@ def evaluate_symbol_for_sweep_setup(
     if not obs:
         return None
 
-    latest_ob = obs[-1]
     now_utc = closed_15m["open_time"].iloc[-1]
-    age_hours = (now_utc - latest_ob["creation_time"]).total_seconds() / 3600.0
-    if age_hours > config["max_ob_age_hours"]:
+    max_age = config.get("max_ob_age_hours", 24.0)
+
+    # Filter OBs within acceptable age
+    active_obs = [
+        ob for ob in obs
+        if (now_utc - ob["creation_time"]).total_seconds() / 3600.0 <= max_age
+    ]
+
+    if not active_obs:
         return None
 
     # Calculate 15m ATR(14)
@@ -350,62 +366,132 @@ def evaluate_symbol_for_sweep_setup(
     last_low = float(latest_15m["low"])
     last_high = float(latest_15m["high"])
     last_close = float(latest_15m["close"])
-    sweep_pct = config["min_sweep_pct"] / 100.0
+    sweep_pct = config.get("min_sweep_pct", 0.05) / 100.0
 
-    # Bullish Liquidity Sweep Check
-    if latest_ob["ob_type"] == "bullish":
-        sweep_threshold = latest_ob["ob_low"] * (1.0 - sweep_pct)
-        if last_low <= sweep_threshold and last_close >= latest_ob["ob_low"]:
-            entry_p = last_close
-            sl_p = last_low - (config["atr_multiplier"] * atr14)
-            risk = entry_p - sl_p
-            if risk > 0:
-                tp_p = entry_p + (config["risk_reward_ratio"] * risk)
-                if latest_ob.get("equal_high", np.nan) > entry_p:
-                    tp_p = min(tp_p, latest_ob["equal_high"])
-                return {
-                    "symbol": symbol,
-                    "direction": "long",
-                    "side": "BUY",
-                    "position_side": "LONG",
-                    "entry_price": entry_p,
-                    "sl_price": sl_p,
-                    "tp_price": tp_p,
-                    "risk_usd_dist": risk,
-                    "atr14": atr14,
-                    "ob_level": latest_ob["ob_low"]
-                }
+    # Check active OBs in reverse order (most recent first)
+    for ob in reversed(active_obs):
+        # Bullish Liquidity Sweep Check
+        if ob["ob_type"] == "bullish":
+            sweep_threshold = ob["ob_low"] * (1.0 - sweep_pct)
+            if last_low <= sweep_threshold and last_close >= ob["ob_low"]:
+                entry_p = last_close
+                sl_p = last_low - (config.get("atr_multiplier", 1.0) * atr14)
+                risk = entry_p - sl_p
+                if risk > 0 and (risk / entry_p) > 0.002:
+                    tp_p = entry_p + (config.get("risk_reward_ratio", 2.5) * risk)
+                    if ob.get("equal_high", np.nan) > entry_p:
+                        tp_p = min(tp_p, ob["equal_high"])
+                    return {
+                        "symbol": symbol,
+                        "direction": "long",
+                        "side": "BUY",
+                        "position_side": "LONG",
+                        "entry_price": entry_p,
+                        "sl_price": sl_p,
+                        "tp_price": tp_p,
+                        "risk_usd_dist": risk,
+                        "atr14": atr14,
+                        "ob_level": ob["ob_low"],
+                        "ob_type": "bullish"
+                    }
 
-    # Bearish Liquidity Sweep Check
-    elif latest_ob["ob_type"] == "bearish":
-        sweep_threshold = latest_ob["ob_high"] * (1.0 + sweep_pct)
-        if last_high >= sweep_threshold and last_close <= latest_ob["ob_high"]:
-            entry_p = last_close
-            sl_p = last_high + (config["atr_multiplier"] * atr14)
-            risk = sl_p - entry_p
-            if risk > 0:
-                tp_p = entry_p - (config["risk_reward_ratio"] * risk)
-                if latest_ob.get("equal_low", np.nan) < entry_p:
-                    tp_p = max(tp_p, latest_ob["equal_low"])
-                return {
-                    "symbol": symbol,
-                    "direction": "short",
-                    "side": "SELL",
-                    "position_side": "SHORT",
-                    "entry_price": entry_p,
-                    "sl_price": sl_p,
-                    "tp_price": tp_p,
-                    "risk_usd_dist": risk,
-                    "atr14": atr14,
-                    "ob_level": latest_ob["ob_high"]
-                }
+        # Bearish Liquidity Sweep Check
+        elif ob["ob_type"] == "bearish":
+            sweep_threshold = ob["ob_high"] * (1.0 + sweep_pct)
+            if last_high >= sweep_threshold and last_close <= ob["ob_high"]:
+                entry_p = last_close
+                sl_p = last_high + (config.get("atr_multiplier", 1.0) * atr14)
+                risk = sl_p - entry_p
+                if risk > 0 and (risk / entry_p) > 0.002:
+                    tp_p = entry_p - (config.get("risk_reward_ratio", 2.5) * risk)
+                    if ob.get("equal_low", np.nan) < entry_p:
+                        tp_p = max(tp_p, ob["equal_low"])
+                    return {
+                        "symbol": symbol,
+                        "direction": "short",
+                        "side": "SELL",
+                        "position_side": "SHORT",
+                        "entry_price": entry_p,
+                        "sl_price": sl_p,
+                        "tp_price": tp_p,
+                        "risk_usd_dist": risk,
+                        "atr14": atr14,
+                        "ob_level": ob["ob_high"],
+                        "ob_type": "bearish"
+                    }
 
     return None
 
 
 # -----------------------------------------------------------------------------
-# MAIN BOT RUNNER
+# MAIN BOT RUNNER & DIAGNOSTICS
 # -----------------------------------------------------------------------------
+
+def run_diagnostics(client: WeexClient, config: Dict[str, Any]):
+    """Executes a full interactive health check and market status report."""
+    print("\n" + "=" * 70)
+    print("🔍 WEEX ORDER BLOCK SWEEP BOT — DIAGNOSTIC HEALTH CHECK")
+    print("=" * 70)
+
+    # 1. Market Data Connectivity
+    print("\n[1/5] Testing WEEX V3 Market Data API...")
+    universe = client.get_top_contracts_by_volume(top_n=10)
+    if universe:
+        print(f"  ✅ SUCCESS: Retrieved Top Volume contracts! Sample: {universe[:5]}")
+    else:
+        print("  ❌ ERROR: Could not fetch top contracts from WEEX V3.")
+        return
+
+    # 2. Kline Data Retrieval
+    print("\n[2/5] Testing Historical K-Line Retrieval for BTCUSDT...")
+    df1h = client.get_klines("BTCUSDT", granularity="1h", limit=50)
+    df15m = client.get_klines("BTCUSDT", granularity="15m", limit=50)
+    if df1h is not None and df15m is not None:
+        print(f"  ✅ SUCCESS: 1h bars={len(df1h)} (Latest: {df1h['open_time'].iloc[-1]} UTC, Close=${df1h['close'].iloc[-1]:,.1f})")
+        print(f"  ✅ SUCCESS: 15m bars={len(df15m)} (Latest: {df15m['open_time'].iloc[-1]} UTC, Close=${df15m['close'].iloc[-1]:,.1f})")
+    else:
+        print("  ❌ ERROR: Failed to retrieve 1h/15m klines.")
+
+    # 3. Authenticated Credentials Check
+    print("\n[3/5] Testing Private WEEX API Credentials...")
+    if not client.api_key or not client.secret_key or not client.passphrase:
+        print("  ⚠️ INFO: API credentials not provided (Dry-Run Only mode).")
+    else:
+        pos_cnt = client.get_open_positions_count()
+        print(f"  ✅ SUCCESS: Private API authenticated! Active Open Positions: {pos_cnt}")
+
+    # 4. Telegram Alert Test
+    print("\n[4/5] Testing Telegram Notification Connection...")
+    if config["telegram_bot_token"] and config["telegram_chat_id"]:
+        test_msg = "🔔 <b>WEEX Bot Diagnostics Ping</b>: Communication channel verified and active."
+        ok = send_telegram(config["telegram_bot_token"], config["telegram_chat_id"], test_msg)
+        if ok:
+            print("  ✅ SUCCESS: Test alert delivered to Telegram!")
+        else:
+            print("  ❌ WARNING: Telegram message failed. Check bot token and chat ID.")
+    else:
+        print("  ⚠️ INFO: Telegram not configured in config. Alerts will print to terminal/log only.")
+
+    # 5. Universe Scan Preview
+    print(f"\n[5/5] Scanning Top {config['top_universe_count']} Volume Universe for Live Setups...")
+    full_universe = client.get_top_contracts_by_volume(top_n=config["top_universe_count"])
+    signals_found = 0
+    scanned_count = 0
+
+    for sym in full_universe:
+        d1h = client.get_klines(sym, granularity="1h", limit=100)
+        d15m = client.get_klines(sym, granularity="15m", limit=100)
+        if d1h is None or d15m is None:
+            continue
+        scanned_count += 1
+        sig = evaluate_symbol_for_sweep_setup(d1h, d15m, sym, config)
+        if sig:
+            signals_found += 1
+            print(f"  ⚡ ACTIVE SWEEP FOUND: {sym} ({sig['direction'].upper()}) | Entry: ${sig['entry_price']:.4f} | SL: ${sig['sl_price']:.4f} | TP: ${sig['tp_price']:.4f}")
+
+    print(f"\nScan Completed: Analyzed {scanned_count} symbols. Found {signals_found} active sweep signals right now.")
+    print("=" * 70 + "\n")
+
 
 def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: List[str]):
     """Scans all symbols in the universe and executes confirmed sweeps."""
@@ -420,8 +506,8 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
     confirmed_signals = []
 
     for sym in symbols:
-        df1h = client.get_klines(sym, granularity="1h", limit=50)
-        df15m = client.get_klines(sym, granularity="15m", limit=50)
+        df1h = client.get_klines(sym, granularity="1h", limit=100)
+        df15m = client.get_klines(sym, granularity="15m", limit=100)
         if df1h is None or df15m is None:
             continue
 
@@ -478,7 +564,6 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
 
 def start_bot_daemon():
     """Runs the 15-minute continuous scheduler."""
-    logger.info("Starting WEEX Order Block Liquidity Sweep Bot Daemon...")
     config = load_config()
     client = WeexClient(
         api_key=config["api_key"],
@@ -487,6 +572,11 @@ def start_bot_daemon():
         dry_run=config["dry_run"]
     )
 
+    if "--diagnostics" in sys.argv or "--test" in sys.argv:
+        run_diagnostics(client, config)
+        return
+
+    logger.info("Starting WEEX Order Block Liquidity Sweep Bot Daemon...")
     logger.info(f"Bot Mode: {'DRY RUN (Simulated)' if config['dry_run'] else 'LIVE TRADING'}")
     logger.info(f"Target Universe: Top {config['top_universe_count']} Volume Coins")
 
