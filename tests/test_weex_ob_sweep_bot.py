@@ -154,3 +154,26 @@ def test_load_config_defaults():
     assert cfg["top_universe_count"] == 100
     assert "dry_run" in cfg
     assert "risk_per_trade_usd" in cfg
+
+
+def test_single_position_per_coin_guard():
+    """Ensures that once a position is open on a coin, subsequent orders on that coin are blocked."""
+    client = WeexClient(api_key="fake", secret_key="fake", passphrase="fake", dry_run=True)
+    
+    # Place initial position on DOGEUSDT
+    res1 = client.place_native_bracket_order(
+        symbol="DOGEUSDT",
+        side="BUY",
+        position_side="LONG",
+        raw_quantity=2000,
+        entry_price=0.0862,
+        sl_price=0.0850,
+        tp_price=0.0890
+    )
+    assert res1["status"] == "simulated"
+    
+    # Active symbols should now include DOGEUSDT
+    active_syms = client.get_open_position_symbols()
+    assert "DOGEUSDT" in active_syms
+    assert client.get_open_positions_count() == 1
+

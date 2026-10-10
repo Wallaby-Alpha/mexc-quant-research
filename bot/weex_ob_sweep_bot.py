@@ -122,6 +122,7 @@ class WeexClient:
         self.secret_key = secret_key
         self.passphrase = passphrase
         self.dry_run = dry_run
+        self.simulated_positions: set = set()
         self.exchange_info: Dict[str, Dict[str, Any]] = {}
         self.refresh_exchange_info()
 
@@ -273,10 +274,10 @@ class WeexClient:
             logger.error(f"Error fetching klines for {symbol}: {e}")
             return None
 
-    def get_open_positions_count(self) -> int:
-        """Fetches currently open positions count."""
-        if self.dry_run or not self.api_key:
-            return 0
+    def get_open_positions(self) -> List[Dict[str, Any]]:
+        """Fetches list of currently open positions from exchange."""
+        if not self.api_key:
+            return []
         path = "/capi/v3/account/position/allPosition"
         try:
             headers = self._get_headers("GET", path)
@@ -285,11 +286,22 @@ class WeexClient:
                 res_data = r.json()
                 pos_list = res_data.get("data", []) if isinstance(res_data, dict) else res_data
                 active = [p for p in pos_list if float(p.get("total", 0.0) or p.get("size", 0.0) or 0.0) > 0]
-                return len(active)
-            return 0
+                return active
+            return []
         except Exception as e:
             logger.warning(f"Could not fetch positions: {e}")
-            return 0
+            return []
+
+    def get_open_position_symbols(self) -> set:
+        """Returns set of symbols that currently have an open position."""
+        if self.dry_run:
+            return set(self.simulated_positions)
+        positions = self.get_open_positions()
+        return {p.get("symbol", "") for p in positions if p.get("symbol")}
+
+    def get_open_positions_count(self) -> int:
+        """Fetches currently open positions count."""
+        return len(self.get_open_position_symbols())
 
     def place_native_bracket_order(
         self,
@@ -319,6 +331,7 @@ class WeexClient:
             return {"status": "error", "error": {"msg": err_msg, "code": "MIN_SIZE_VIOLATION"}}
 
         if self.dry_run:
+            self.simulated_positions.add(symbol)
             logger.info(f"[DRY-RUN SIMULATION] {side} {position_side} {qty_str} {symbol} | Entry: {entry_str} | SL: {sl_str} | TP: {tp_str}")
             return {
                 "status": "simulated",
@@ -610,18 +623,26 @@ def run_diagnostics(client: WeexClient, config: Dict[str, Any]):
 
 
 def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: List[str]):
-    """Scans all symbols in the universe and executes confirmed sweeps."""
-    logger.info(f"Scanning {len(symbols)} Top Volume symbols for 15m Order Block Sweeps...")
-    active_positions = client.get_open_positions_count()
+    """Scans all symbols in the universe and executes confirmed sweeps without duplicate coin positions."""
+    active_symbols = client.get_open_position_symbols()
+    active_positions = len(active_symbols)
     max_pos = config["max_concurrent_positions"]
+
+    if active_symbols:
+        logger.info(f"Existing active position(s) on {len(active_symbols)} coin(s): {sorted(list(active_symbols))}")
 
     if active_positions >= max_pos:
         logger.info(f"Max concurrent positions reached ({active_positions}/{max_pos}). Skipping scan cycle.")
         return
 
+    logger.info(f"Scanning {len(symbols)} Top Volume symbols for 15m Order Block Sweeps...")
     confirmed_signals = []
 
     for sym in symbols:
+        # Never enter or scan a second position on the same coin
+        if sym in active_symbols:
+            continue
+
         df1h = client.get_klines(sym, granularity="1h", limit=100)
         df15m = client.get_klines(sym, granularity="15m", limit=100)
         if df1h is None or df15m is None:
@@ -634,11 +655,16 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
     logger.info(f"Scan finished. Found {len(confirmed_signals)} sweep signals.")
 
     for sig in confirmed_signals:
-        if active_positions >= max_pos:
-            logger.info("Maximum positions filled. Halting execution.")
+        sym = sig["symbol"]
+        # Double check to prevent duplicate position on the same coin
+        if sym in active_symbols:
+            logger.info(f"Skipping {sym}: Position already active on this coin.")
+            continue
+
+        if len(active_symbols) >= max_pos:
+            logger.info(f"Maximum positions filled ({len(active_symbols)}/{max_pos}). Halting execution.")
             break
 
-        sym = sig["symbol"]
         entry = sig["entry_price"]
         sl = sig["sl_price"]
         tp = sig["tp_price"]
@@ -669,7 +695,7 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
 
         # 1. LIVE ORDER FILLED
         if status == "success":
-            active_positions += 1
+            active_symbols.add(sym)
             order_id = result.get("orderId", "N/A")
             msg = (
                 f"⚡ <b>[LIVE ORDER EXECUTED] SMC ORDER BLOCK SWEEP!</b>\n"
@@ -679,13 +705,13 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
                 f"• <b>Native Exchange TP:</b> <code>${formatted_tp}</code> (+2.5R)\n"
                 f"• Position Size: <code>{formatted_qty}</code> units (${risk_amount:,.0f} risk)\n"
                 f"• Order ID: <code>{order_id}</code>\n"
-                f"• Active Positions: <code>{active_positions}/{max_pos}</code>"
+                f"• Active Positions: <code>{len(active_symbols)}/{max_pos}</code>"
             )
             send_telegram(config["telegram_bot_token"], config["telegram_chat_id"], msg)
 
         # 2. DRY-RUN SIMULATION
         elif status == "simulated":
-            active_positions += 1
+            active_symbols.add(sym)
             msg = (
                 f"🚨 <b>[DRY-RUN SIMULATION] SMC ORDER BLOCK SWEEP!</b>\n"
                 f"• Contract: <code>{sym}</code> ({sig['direction'].upper()})\n"
@@ -693,7 +719,7 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
                 f"• <b>Simulated SL:</b> <code>${formatted_sl}</code> (-1x ATR)\n"
                 f"• <b>Simulated TP:</b> <code>${formatted_tp}</code> (+2.5R)\n"
                 f"• Position Size: <code>{formatted_qty}</code> units (${risk_amount:,.0f} risk)\n"
-                f"• Active Positions: <code>{active_positions}/{max_pos}</code>"
+                f"• Active Positions: <code>{len(active_symbols)}/{max_pos}</code>"
             )
             send_telegram(config["telegram_bot_token"], config["telegram_chat_id"], msg)
 
