@@ -372,12 +372,52 @@ class WeexClient:
                     "formatted_sl": sl_str,
                     "formatted_tp": tp_str
                 }
+            # Auto-retry with positionSide="BOTH" if account is in One-Way Mode (triggers -1191)
+            elif str(res.get("code")) in ("-1191", "1191") and position_side.upper() in ("LONG", "SHORT"):
+                logger.warning(f"Got -1191 for {symbol} with positionSide={position_side}. Retrying with positionSide=BOTH (One-Way Mode)...")
+                payload_both = dict(payload)
+                payload_both["positionSide"] = "BOTH"
+                body_both = json.dumps(payload_both)
+                headers_both = self._get_headers("POST", path, body=body_both)
+                r_both = requests.post(f"{self.base_url}{path}", headers=headers_both, data=body_both, timeout=12)
+                res_both = r_both.json()
+                if r_both.status_code == 200 and res_both.get("code") == "00000":
+                    logger.info(f"✅ Live WEEX Order Placed with positionSide=BOTH: {symbol} | Response: {res_both}")
+                    return {
+                        "status": "success",
+                        "orderId": res_both.get("data", {}).get("orderId", "N/A"),
+                        "data": res_both.get("data"),
+                        "formatted_qty": qty_str,
+                        "formatted_sl": sl_str,
+                        "formatted_tp": tp_str
+                    }
+                else:
+                    logger.error(f"❌ WEEX Order Rejected with positionSide=BOTH: {res_both}")
+                    return {
+                        "status": "error",
+                        "error": res_both,
+                        "formatted_qty": qty_str,
+                        "formatted_sl": sl_str,
+                        "formatted_tp": tp_str
+                    }
             else:
                 logger.error(f"❌ WEEX Order Rejected by Exchange: HTTP {r.status_code} | Body: {res}")
-                return {"status": "error", "error": res}
+                return {
+                    "status": "error",
+                    "error": res,
+                    "formatted_qty": qty_str,
+                    "formatted_sl": sl_str,
+                    "formatted_tp": tp_str
+                }
         except Exception as e:
             logger.error(f"Exception submitting WEEX order: {e}")
-            return {"status": "error", "error": str(e)}
+            return {
+                "status": "error",
+                "error": str(e),
+                "formatted_qty": qty_str,
+                "formatted_sl": sl_str,
+                "formatted_tp": tp_str
+            }
 
 
 # -----------------------------------------------------------------------------
