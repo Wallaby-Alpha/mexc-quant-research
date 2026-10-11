@@ -85,6 +85,9 @@ nano /root/mexc-quant-research/weex_bot_config.json
   "max_concurrent_positions": 5,
   "risk_reward_ratio": 2.5,
   "atr_multiplier": 1.0,
+  "btc_regime_filter": true,
+  "btc_symbol": "BTCUSDT",
+  "btc_ema_span": 50,
   "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
   "telegram_chat_id": "YOUR_TELEGRAM_CHAT_ID"
 }

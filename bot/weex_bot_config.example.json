@@ -11,6 +11,9 @@
   "atr_multiplier": 1.0,
   "max_ob_age_hours": 8.0,
   "min_sweep_pct": 0.05,
+  "btc_regime_filter": true,
+  "btc_symbol": "BTCUSDT",
+  "btc_ema_span": 50,
   "telegram_bot_token": "",
   "telegram_chat_id": "",
   "poll_interval_seconds": 900

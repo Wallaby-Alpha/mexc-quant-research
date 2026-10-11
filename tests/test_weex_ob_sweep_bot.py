@@ -19,6 +19,7 @@ from bot.weex_ob_sweep_bot import (
     WeexClient,
     find_fractal_swings,
     evaluate_symbol_for_sweep_setup,
+    evaluate_btc_macro_regime,
     load_config
 )
 
@@ -176,4 +177,70 @@ def test_single_position_per_coin_guard():
     active_syms = client.get_open_position_symbols()
     assert "DOGEUSDT" in active_syms
     assert client.get_open_positions_count() == 1
+
+
+def test_evaluate_btc_macro_regime_bullish_and_bearish():
+    """Validates BTC Macro 1h 50 EMA regime classification."""
+    base_time = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    times = [base_time + timedelta(hours=i) for i in range(70)]
+
+    # 1. Bullish scenario: prices rise from 50k to 70k, latest closed candle well above 50 EMA
+    closes_bull = [50000.0 + (i * 300.0) for i in range(70)]
+    df_bull = pd.DataFrame({
+        "open_time": times,
+        "open": closes_bull,
+        "high": [c + 100 for c in closes_bull],
+        "low": [c - 100 for c in closes_bull],
+        "close": closes_bull,
+        "volume": [100.0] * 70
+    })
+
+    reg_bull = evaluate_btc_macro_regime(df_bull, ema_span=50)
+    assert reg_bull["regime"] == "BULLISH"
+    assert reg_bull["allowed_direction"] == "long"
+    assert reg_bull["is_bullish"] is True
+    assert reg_bull["btc_close"] > reg_bull["btc_ema"]
+
+    # 2. Bearish scenario: prices fall from 70k down to 40k, latest closed candle well below 50 EMA
+    closes_bear = [70000.0 - (i * 450.0) for i in range(70)]
+    df_bear = pd.DataFrame({
+        "open_time": times,
+        "open": closes_bear,
+        "high": [c + 100 for c in closes_bear],
+        "low": [c - 100 for c in closes_bear],
+        "close": closes_bear,
+        "volume": [100.0] * 70
+    })
+
+    reg_bear = evaluate_btc_macro_regime(df_bear, ema_span=50)
+    assert reg_bear["regime"] == "BEARISH"
+    assert reg_bear["allowed_direction"] == "short"
+    assert reg_bear["is_bullish"] is False
+    assert reg_bear["btc_close"] < reg_bear["btc_ema"]
+
+
+def test_btc_macro_regime_lookahead_prevention():
+    """Validates that evaluate_btc_macro_regime strictly excludes the active forming bar (Rule 1)."""
+    base_time = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    times = [base_time + timedelta(hours=i) for i in range(60)]
+    
+    # 59 closed bars hovering around 50,000
+    closes = [50000.0] * 59
+    # 60th bar (the active forming candle at index 59) has an artificial huge spike to 999,999
+    closes.append(999999.0)
+
+    df = pd.DataFrame({
+        "open_time": times,
+        "open": closes,
+        "high": closes,
+        "low": closes,
+        "close": closes,
+        "volume": [100.0] * 60
+    })
+
+    reg = evaluate_btc_macro_regime(df, ema_span=50)
+    # The active candle (index 59 with close 999,999) must NOT be used.
+    # The evaluation must reflect index 58 with close 50,000.
+    assert reg["btc_close"] == 50000.0
+    assert reg["bar_time"] == times[58]
 

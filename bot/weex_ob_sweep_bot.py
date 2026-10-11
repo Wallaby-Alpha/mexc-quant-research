@@ -77,6 +77,9 @@ def load_config() -> Dict[str, Any]:
         "atr_multiplier": 1.0,
         "max_ob_age_hours": 24.0,
         "min_sweep_pct": 0.05,
+        "btc_regime_filter": True,
+        "btc_symbol": "BTCUSDT",
+        "btc_ema_span": 50,
         "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
         "poll_interval_seconds": 900
@@ -587,6 +590,65 @@ def evaluate_symbol_for_sweep_setup(
     return None
 
 
+def evaluate_btc_macro_regime(
+    df_btc_1h: Optional[pd.DataFrame],
+    ema_span: int = 50
+) -> Dict[str, Any]:
+    """
+    Evaluates BTC macro market trend on 1h timeframe using strictly closed candles.
+    Rule 1 (No lookahead): Excludes the active, currently forming 1h candle.
+    Information availability: uses df_btc_1h.iloc[:-1] only.
+
+    Returns:
+        dict with:
+            - regime: "BULLISH" | "BEARISH" | "UNKNOWN"
+            - allowed_direction: "long" | "short" | "both"
+            - btc_close: latest fully closed 1h price
+            - btc_ema: latest 1h EMA value
+            - is_bullish: bool
+            - bar_time: timestamp of latest closed candle
+    """
+    if df_btc_1h is None or len(df_btc_1h) < max(10, ema_span // 2):
+        return {
+            "regime": "UNKNOWN",
+            "allowed_direction": "both",
+            "btc_close": 0.0,
+            "btc_ema": 0.0,
+            "is_bullish": False,
+            "bar_time": None
+        }
+
+    # Strict lookahead prevention: exclude active forming candle
+    closed_1h = df_btc_1h.iloc[:-1].copy() if len(df_btc_1h) > 1 else df_btc_1h.copy()
+    if closed_1h.empty or len(closed_1h) < 5:
+        return {
+            "regime": "UNKNOWN",
+            "allowed_direction": "both",
+            "btc_close": 0.0,
+            "btc_ema": 0.0,
+            "is_bullish": False,
+            "bar_time": None
+        }
+
+    s_close = closed_1h["close"].astype(float)
+    ema = s_close.ewm(span=ema_span, adjust=False).mean()
+    latest_close = float(s_close.iloc[-1])
+    latest_ema = float(ema.iloc[-1])
+    is_bullish = latest_close >= latest_ema
+
+    regime = "BULLISH" if is_bullish else "BEARISH"
+    allowed_dir = "long" if is_bullish else "short"
+
+    return {
+        "regime": regime,
+        "allowed_direction": allowed_dir,
+        "btc_close": latest_close,
+        "btc_ema": latest_ema,
+        "is_bullish": is_bullish,
+        "bar_time": closed_1h["open_time"].iloc[-1]
+    }
+
+
 # -----------------------------------------------------------------------------
 # MAIN BOT RUNNER & DIAGNOSTICS
 # -----------------------------------------------------------------------------
@@ -606,13 +668,17 @@ def run_diagnostics(client: WeexClient, config: Dict[str, Any]):
         print("  ❌ ERROR: Could not fetch top contracts from WEEX V3.")
         return
 
-    # 2. Kline Data Retrieval
-    print("\n[2/5] Testing Historical K-Line Retrieval for BTCUSDT...")
-    df1h = client.get_klines("BTCUSDT", granularity="1h", limit=50)
+    # 2. Kline Data Retrieval & BTC Regime Check
+    print("\n[2/5] Testing Historical K-Line Retrieval & BTC Macro Regime...")
+    df1h = client.get_klines("BTCUSDT", granularity="1h", limit=100)
     df15m = client.get_klines("BTCUSDT", granularity="15m", limit=50)
     if df1h is not None and df15m is not None:
         print(f"  ✅ SUCCESS: 1h bars={len(df1h)} (Latest: {df1h['open_time'].iloc[-1]} UTC, Close=${df1h['close'].iloc[-1]:,.1f})")
         print(f"  ✅ SUCCESS: 15m bars={len(df15m)} (Latest: {df15m['open_time'].iloc[-1]} UTC, Close=${df15m['close'].iloc[-1]:,.1f})")
+        btc_reg = evaluate_btc_macro_regime(df1h, ema_span=config.get("btc_ema_span", 50))
+        status_icon = "🟢" if btc_reg["is_bullish"] else "🔴"
+        print(f"  🌐 BTC Macro Regime Filter: {status_icon} {btc_reg['regime']} (BTC Close=${btc_reg['btc_close']:,.1f} vs EMA{config.get('btc_ema_span', 50)}=${btc_reg['btc_ema']:,.1f})")
+        print(f"     Permitted Execution Direction: {btc_reg['allowed_direction'].upper()} ONLY")
     else:
         print("  ❌ ERROR: Failed to retrieve 1h/15m klines.")
 
@@ -675,6 +741,21 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
         logger.info(f"Max concurrent positions reached ({active_positions}/{max_pos}). Skipping scan cycle.")
         return
 
+    # 1. Evaluate BTC Macro Regime Filter
+    btc_regime = {"regime": "UNKNOWN", "allowed_direction": "both", "is_bullish": False, "btc_close": 0.0, "btc_ema": 0.0}
+    if config.get("btc_regime_filter", True):
+        btc_sym = config.get("btc_symbol", "BTCUSDT")
+        df_btc = client.get_klines(btc_sym, granularity="1h", limit=100)
+        btc_regime = evaluate_btc_macro_regime(df_btc, ema_span=config.get("btc_ema_span", 50))
+        if btc_regime["regime"] != "UNKNOWN":
+            logger.info(
+                f"🌐 BTC Macro Regime: {btc_regime['regime']} "
+                f"(BTC ${btc_regime['btc_close']:,.1f} vs EMA{config.get('btc_ema_span', 50)} ${btc_regime['btc_ema']:,.1f}) "
+                f"| Permitted Direction: {btc_regime['allowed_direction'].upper()} ONLY"
+            )
+        else:
+            logger.warning("Could not resolve BTC Macro Regime; proceeding without regime gate.")
+
     logger.info(f"Scanning {len(symbols)} Top Volume symbols for 15m Order Block Sweeps...")
     confirmed_signals = []
 
@@ -690,9 +771,21 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
 
         sig = evaluate_symbol_for_sweep_setup(df1h, df15m, sym, config)
         if sig:
+            # Apply BTC Macro Regime gate
+            if btc_regime["regime"] != "UNKNOWN" and sig["direction"] != btc_regime["allowed_direction"]:
+                logger.info(
+                    f"🛡️ Filtered {sym} ({sig['direction'].upper()}): Conflict with BTC Macro Regime "
+                    f"({btc_regime['regime']} permits {btc_regime['allowed_direction'].upper()} only)"
+                )
+                continue
             confirmed_signals.append(sig)
 
-    logger.info(f"Scan finished. Found {len(confirmed_signals)} sweep signals.")
+    logger.info(f"Scan finished. Found {len(confirmed_signals)} regime-compliant sweep signals.")
+
+    regime_desc = (
+        f"• Market Regime: {'🟢 BULLISH' if btc_regime.get('is_bullish') else '🔴 BEARISH'} "
+        f"(BTC ${btc_regime.get('btc_close', 0):,.1f} vs EMA{config.get('btc_ema_span', 50)})\n"
+    ) if btc_regime.get("regime") != "UNKNOWN" else ""
 
     for sig in confirmed_signals:
         sym = sig["symbol"]
@@ -740,6 +833,7 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
             msg = (
                 f"⚡ <b>[LIVE ORDER EXECUTED] SMC ORDER BLOCK SWEEP!</b>\n"
                 f"• Contract: <code>{sym}</code> ({sig['direction'].upper()})\n"
+                f"{regime_desc}"
                 f"• Entry: <code>${entry:,.4f}</code>\n"
                 f"• <b>Native Exchange SL:</b> <code>${formatted_sl}</code> (-1x ATR)\n"
                 f"• <b>Native Exchange TP:</b> <code>${formatted_tp}</code> (+2.5R)\n"
@@ -755,6 +849,7 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
             msg = (
                 f"🚨 <b>[DRY-RUN SIMULATION] SMC ORDER BLOCK SWEEP!</b>\n"
                 f"• Contract: <code>{sym}</code> ({sig['direction'].upper()})\n"
+                f"{regime_desc}"
                 f"• Entry: <code>${entry:,.4f}</code>\n"
                 f"• <b>Simulated SL:</b> <code>${formatted_sl}</code> (-1x ATR)\n"
                 f"• <b>Simulated TP:</b> <code>${formatted_tp}</code> (+2.5R)\n"
@@ -805,10 +900,12 @@ def start_bot_daemon():
     last_universe_refresh = time.time()
 
     # Send Startup Message
+    regime_mode_desc = f"1h {config.get('btc_ema_span', 50)} EMA" if config.get("btc_regime_filter", True) else "DISABLED"
     startup_msg = (
         f"🤖 <b>WEEX SMC ORDER BLOCK BOT INITIALIZED</b>\n"
         f"• Mode: <code>{'DRY-RUN SIMULATION' if config['dry_run'] else 'LIVE EXECUTION'}</code>\n"
         f"• Universe: <b>Top {len(universe)} Volume Coins</b>\n"
+        f"• BTC Macro Regime Filter: <b>{regime_mode_desc}</b>\n"
         f"• Risk per Trade: <code>${config['risk_per_trade_usd']:,.0f}</code>\n"
         f"• Native Bracket Target: <b>2.5R</b> | Stop: <b>1x ATR(14)</b>\n"
         f"• Cadence: <b>Every 15 Minutes at Candle Close</b>"
