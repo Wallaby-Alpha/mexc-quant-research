@@ -74,6 +74,7 @@ def load_config() -> Dict[str, Any]:
         "account_size_usd": 10000.0,
         "max_concurrent_positions": 5,
         "risk_reward_ratio": 2.5,
+        "min_risk_reward_ratio": 1.0,
         "atr_multiplier": 1.0,
         "max_ob_age_hours": 24.0,
         "min_sweep_pct": 0.05,
@@ -548,6 +549,11 @@ def evaluate_symbol_for_sweep_setup(
                     tp_p = entry_p + (config.get("risk_reward_ratio", 2.5) * risk)
                     if ob.get("equal_high", np.nan) > entry_p:
                         tp_p = min(tp_p, ob["equal_high"])
+                    reward = tp_p - entry_p
+                    effective_rr = reward / risk if risk > 0 else 0.0
+                    min_rr = config.get("min_risk_reward_ratio", 1.0)
+                    if effective_rr < min_rr:
+                        continue  # Skip setup: natural structural target offers less than minimum R:R
                     return {
                         "symbol": symbol,
                         "direction": "long",
@@ -557,6 +563,7 @@ def evaluate_symbol_for_sweep_setup(
                         "sl_price": sl_p,
                         "tp_price": tp_p,
                         "risk_usd_dist": risk,
+                        "effective_rr": round(effective_rr, 2),
                         "atr14": atr14,
                         "ob_level": ob["ob_low"],
                         "ob_type": "bullish"
@@ -573,6 +580,11 @@ def evaluate_symbol_for_sweep_setup(
                     tp_p = entry_p - (config.get("risk_reward_ratio", 2.5) * risk)
                     if ob.get("equal_low", np.nan) < entry_p:
                         tp_p = max(tp_p, ob["equal_low"])
+                    reward = entry_p - tp_p
+                    effective_rr = reward / risk if risk > 0 else 0.0
+                    min_rr = config.get("min_risk_reward_ratio", 1.0)
+                    if effective_rr < min_rr:
+                        continue  # Skip setup: natural structural target offers less than minimum R:R
                     return {
                         "symbol": symbol,
                         "direction": "short",
@@ -582,6 +594,7 @@ def evaluate_symbol_for_sweep_setup(
                         "sl_price": sl_p,
                         "tp_price": tp_p,
                         "risk_usd_dist": risk,
+                        "effective_rr": round(effective_rr, 2),
                         "atr14": atr14,
                         "ob_level": ob["ob_high"],
                         "ob_type": "bearish"
@@ -830,13 +843,14 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
         if status == "success":
             active_symbols.add(sym)
             order_id = result.get("orderId", "N/A")
+            effective_rr = sig.get("effective_rr", config.get("risk_reward_ratio", 2.5))
             msg = (
                 f"⚡ <b>[LIVE ORDER EXECUTED] SMC ORDER BLOCK SWEEP!</b>\n"
                 f"• Contract: <code>{sym}</code> ({sig['direction'].upper()})\n"
                 f"{regime_desc}"
                 f"• Entry: <code>${entry:,.4f}</code>\n"
                 f"• <b>Native Exchange SL:</b> <code>${formatted_sl}</code> (-1x ATR)\n"
-                f"• <b>Native Exchange TP:</b> <code>${formatted_tp}</code> (+2.5R)\n"
+                f"• <b>Native Exchange TP:</b> <code>${formatted_tp}</code> (+{effective_rr:.1f}R)\n"
                 f"• Position Size: <code>{formatted_qty}</code> units (${risk_amount:,.0f} risk)\n"
                 f"• Order ID: <code>{order_id}</code>\n"
                 f"• Active Positions: <code>{len(active_symbols)}/{max_pos}</code>"
@@ -846,13 +860,14 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
         # 2. DRY-RUN SIMULATION
         elif status == "simulated":
             active_symbols.add(sym)
+            effective_rr = sig.get("effective_rr", config.get("risk_reward_ratio", 2.5))
             msg = (
                 f"🚨 <b>[DRY-RUN SIMULATION] SMC ORDER BLOCK SWEEP!</b>\n"
                 f"• Contract: <code>{sym}</code> ({sig['direction'].upper()})\n"
                 f"{regime_desc}"
                 f"• Entry: <code>${entry:,.4f}</code>\n"
                 f"• <b>Simulated SL:</b> <code>${formatted_sl}</code> (-1x ATR)\n"
-                f"• <b>Simulated TP:</b> <code>${formatted_tp}</code> (+2.5R)\n"
+                f"• <b>Simulated TP:</b> <code>${formatted_tp}</code> (+{effective_rr:.1f}R)\n"
                 f"• Position Size: <code>{formatted_qty}</code> units (${risk_amount:,.0f} risk)\n"
                 f"• Active Positions: <code>{len(active_symbols)}/{max_pos}</code>"
             )

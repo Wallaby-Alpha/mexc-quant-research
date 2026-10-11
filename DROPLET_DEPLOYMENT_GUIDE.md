@@ -84,6 +84,7 @@ nano /root/mexc-quant-research/weex_bot_config.json
   "account_size_usd": 10000.0,
   "max_concurrent_positions": 5,
   "risk_reward_ratio": 2.5,
+  "min_risk_reward_ratio": 1.0,
   "atr_multiplier": 1.0,
   "btc_regime_filter": true,
   "btc_symbol": "BTCUSDT",

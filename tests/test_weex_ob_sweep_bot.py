@@ -244,3 +244,116 @@ def test_btc_macro_regime_lookahead_prevention():
     assert reg["btc_close"] == 50000.0
     assert reg["bar_time"] == times[58]
 
+
+def test_minimum_risk_reward_filter_skips_sub_1r_trades():
+    """Validates that evaluate_symbol_for_sweep_setup strictly skips trades where the natural target is < min_risk_reward_ratio."""
+    base_time = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    times_1h = [base_time + timedelta(hours=i) for i in range(40)]
+    opens_1h = [100.0] * 40
+    highs_1h = [102.0] * 40
+    lows_1h = [98.0] * 40
+    closes_1h = [100.0] * 40
+
+    # Fractal high at index 5 is 110.0
+    highs_1h[5] = 110.0
+    opens_1h[8] = 95.0
+    closes_1h[8] = 90.0
+    highs_1h[8] = 96.0
+    lows_1h[8] = 88.0
+    closes_1h[12] = 115.0
+    highs_1h[12] = 116.0
+
+    df1h = pd.DataFrame({
+        "open_time": times_1h,
+        "open": opens_1h,
+        "high": highs_1h,
+        "low": lows_1h,
+        "close": closes_1h,
+        "volume": [1000.0] * 40
+    })
+
+    times_15m = [times_1h[13] + timedelta(minutes=15 * i) for i in range(40)]
+    opens_15m = [92.0] * 40
+    highs_15m = [94.0] * 40
+    lows_15m = [90.0] * 40
+    closes_15m = [92.0] * 40
+
+    lows_15m[38] = 87.0
+    closes_15m[38] = 89.0
+    highs_15m[38] = 90.0
+
+    df15m = pd.DataFrame({
+        "open_time": times_15m,
+        "open": opens_15m,
+        "high": highs_15m,
+        "low": lows_15m,
+        "close": closes_15m,
+        "volume": [500.0] * 40
+    })
+
+    # Case 1: Standard 2.5R target is accepted when min_risk_reward_ratio is 1.0
+    cfg_standard = {
+        "max_ob_age_hours": 24.0,
+        "min_sweep_pct": 0.05,
+        "atr_multiplier": 1.0,
+        "risk_reward_ratio": 2.5,
+        "min_risk_reward_ratio": 1.0
+    }
+    sig_standard = evaluate_symbol_for_sweep_setup(df1h, df15m, "TESTUSDT", cfg_standard)
+    assert sig_standard is not None
+    assert sig_standard["effective_rr"] == 2.5
+
+    # Case 2: When min_risk_reward_ratio is set higher than available (e.g. 3.0), setup is skipped
+    cfg_strict = {
+        "max_ob_age_hours": 24.0,
+        "min_sweep_pct": 0.05,
+        "atr_multiplier": 1.0,
+        "risk_reward_ratio": 2.5,
+        "min_risk_reward_ratio": 3.0
+    }
+    sig_strict = evaluate_symbol_for_sweep_setup(df1h, df15m, "TESTUSDT", cfg_strict)
+    assert sig_strict is None
+
+    # Case 3: When equal_high clamps target below 1R, setup is skipped
+    # Base highs at 88.0, fractal swing high at 92.0 (only 3.0 above entry 89.0, while risk is ~6.0 -> 0.5R)
+    opens_1h_c = [88.0] * 40
+    highs_1h_c = [89.0] * 40
+    lows_1h_c = [86.0] * 40
+    closes_1h_c = [88.0] * 40
+    highs_1h_c[5] = 92.0
+    opens_1h_c[8] = 89.0
+    closes_1h_c[8] = 87.0
+    highs_1h_c[8] = 90.0
+    lows_1h_c[8] = 86.0
+    closes_1h_c[12] = 94.0
+    highs_1h_c[12] = 95.0
+
+    df1h_c = pd.DataFrame({
+        "open_time": times_1h,
+        "open": opens_1h_c,
+        "high": highs_1h_c,
+        "low": lows_1h_c,
+        "close": closes_1h_c,
+        "volume": [1000.0] * 40
+    })
+
+    # Sweep below 86.0 to 85.0, close at 87.0
+    lows_15m_c = [88.0] * 40
+    closes_15m_c = [88.0] * 40
+    lows_15m_c[38] = 85.0
+    closes_15m_c[38] = 87.0
+    df15m_c = pd.DataFrame({
+        "open_time": times_15m,
+        "open": [88.0] * 40,
+        "high": [90.0] * 40,
+        "low": lows_15m_c,
+        "close": closes_15m_c,
+        "volume": [500.0] * 40
+    })
+
+    # Entry = 87.0. equal_high = 92.0. Reward = 5.0. Risk = 87.0 - (85.0 - 4.0) = 6.0.
+    # Effective R:R = 5.0 / 6.0 = 0.83R (< 1.0R).
+    sig_sub_1r = evaluate_symbol_for_sweep_setup(df1h_c, df15m_c, "TESTUSDT", cfg_standard)
+    assert sig_sub_1r is None  # Skipped because 0.83R < 1.0R
+
+
