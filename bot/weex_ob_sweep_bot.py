@@ -69,7 +69,7 @@ def load_config() -> Dict[str, Any]:
         "secret_key": os.environ.get("WEEX_SECRET_KEY", ""),
         "passphrase": os.environ.get("WEEX_PASSPHRASE", ""),
         "dry_run": True,
-        "top_universe_count": 100,
+        "top_universe_count": 200,
         "risk_per_trade_usd": 100.0,
         "account_size_usd": 10000.0,
         "max_concurrent_positions": 5,
