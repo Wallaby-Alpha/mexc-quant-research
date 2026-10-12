@@ -5,21 +5,21 @@ Production Automated SMC/ICT Order Block Liquidity Sweep Trading Bot for WEEX.
 Targets: Top 100 Crypto Contracts by Volume (WEEX Contract V3 API).
 
 Core Strategy Logic:
-1. Higher Timeframe (1h): Detects confirmed Order Blocks (last down-close before BOS breakout).
-2. Lower Timeframe (15m): Detects Liquidity Sweeps (penetrates OB by >= 0.05% and closes back inside).
+1. Higher Timeframe (4h Default): Detects confirmed Order Blocks (last down-close before BOS breakout).
+2. Lower Timeframe (1h Default): Detects Liquidity Sweeps (penetrates OB by >= 0.05% and closes back inside).
 3. Risk Management & Execution:
    - Dynamic Precision Engine: Formats quantity and prices strictly to WEEX exchangeInfo specs
      (contractVal, minOrderSize, quantityPrecision, pricePrecision).
-   - Stop Loss: 1x ATR(14) below the sweep low.
-   - Take Profit: Equal highs or 2.5R.
+   - Stop Loss: 1x ATR(14) below/above the sweep low/high.
+   - Take Profit: Structural range target (equal highs/lows) or up to 2.5R.
+   - Minimum R:R Filter: Skips setups where natural target offers < 1.0R.
+   - BTC Macro Regime Filter: Longs only when BTC >= 1h 50 EMA, shorts only when BTC < 1h 50 EMA.
    - Native Exchange Brackets: Submits preset SL & TP directly to WEEX matching engine.
 4. Operational Features:
    - Dynamic Top 100 Universe Scanner via WEEX V3 Contract API (/capi/v3/market/ticker/24hr).
-   - Real-time V3 K-line fetching (/capi/v3/market/klines).
-   - Real-time Account Balance and Margin validation (/capi/v3/account/balance).
-   - Accurate Alerting: Distinguishes between Success, Dry-Run, and Exchange Rejections.
-   - Interactive Diagnostics & Health Check CLI flag (--diagnostics).
-   - Automatic 15-minute synchronization loop (:00, :15, :30, :45 UTC).
+   - Real-time V3 K-line fetching with 4h and 1h intervals.
+   - Single Position per Coin Guard (prevents re-entering the same coin).
+   - Hourly synchronization loop (:00 UTC).
 """
 
 import os
@@ -73,17 +73,19 @@ def load_config() -> Dict[str, Any]:
         "risk_per_trade_usd": 100.0,
         "account_size_usd": 10000.0,
         "max_concurrent_positions": 5,
+        "htf_timeframe": "4h",
+        "ltf_timeframe": "1h",
         "risk_reward_ratio": 2.5,
         "min_risk_reward_ratio": 1.0,
         "atr_multiplier": 1.0,
-        "max_ob_age_hours": 24.0,
+        "max_ob_age_hours": 72.0,
         "min_sweep_pct": 0.05,
         "btc_regime_filter": True,
         "btc_symbol": "BTCUSDT",
         "btc_ema_span": 50,
         "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
-        "poll_interval_seconds": 900
+        "poll_interval_seconds": 3600
     }
 
     for c in candidates:
@@ -250,13 +252,13 @@ class WeexClient:
             logger.error(f"Error getting top contracts: {e}")
             return []
 
-    def get_klines(self, symbol: str, granularity: str = "15m", limit: int = 100) -> Optional[pd.DataFrame]:
+    def get_klines(self, symbol: str, granularity: str = "1h", limit: int = 100) -> Optional[pd.DataFrame]:
         """Fetches historical klines for analysis via V3 API."""
         url = f"{self.base_url}/capi/v3/market/klines"
-        gran_map = {"15m": "15m", "1h": "1h", "1d": "1d"}
+        gran_map = {"15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d"}
         params = {
             "symbol": symbol,
-            "interval": gran_map.get(granularity, "15m"),
+            "interval": gran_map.get(granularity, "1h"),
             "limit": limit
         }
         try:
@@ -444,64 +446,65 @@ def find_fractal_swings(highs: np.ndarray, lows: np.ndarray, n: int = 2) -> Tupl
 
 
 def evaluate_symbol_for_sweep_setup(
-    df1h: pd.DataFrame,
-    df15m: pd.DataFrame,
+    df_htf: pd.DataFrame,
+    df_ltf: pd.DataFrame,
     symbol: str,
     config: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
     """
-    Evaluates whether the symbol currently has a fresh 15m Order Block Liquidity Sweep.
+    Evaluates whether the symbol currently has a fresh Lower Timeframe Liquidity Sweep
+    of a confirmed Higher Timeframe Order Block.
     Checks all valid active order blocks formed within max_ob_age_hours.
     """
-    if len(df1h) < 20 or len(df15m) < 20:
+    if len(df_htf) < 20 or len(df_ltf) < 20:
         return None
 
     # Exclude open forming candle; analyze fully closed historical candles
-    closed_1h = df1h.iloc[:-1].copy()
-    closed_15m = df15m.iloc[:-1].copy()
+    closed_htf = df_htf.iloc[:-1].copy()
+    closed_ltf = df_ltf.iloc[:-1].copy()
 
-    h_1h = closed_1h["high"].values
-    l_1h = closed_1h["low"].values
-    o_1h = closed_1h["open"].values
-    c_1h = closed_1h["close"].values
-    times_1h = closed_1h["open_time"].tolist()
+    h_htf = closed_htf["high"].values
+    l_htf = closed_htf["low"].values
+    o_htf = closed_htf["open"].values
+    c_htf = closed_htf["close"].values
+    times_htf = closed_htf["open_time"].tolist()
 
-    sh_1h, sl_1h = find_fractal_swings(h_1h, l_1h, n=2)
+    sh_htf, sl_htf = find_fractal_swings(h_htf, l_htf, n=2)
 
-    # 1. Identify Confirmed 1h Order Blocks
+    # 1. Identify Confirmed HTF Order Blocks
     obs = []
     last_sh_broken = np.nan
     last_sl_broken = np.nan
 
-    for i in range(5, len(closed_1h)):
-        bar_t = times_1h[i]
-        curr_sh = sh_1h[i]
-        curr_sl = sl_1h[i]
+    for i in range(5, len(closed_htf)):
+        bar_t = times_htf[i]
+        curr_sh = sh_htf[i]
+        curr_sl = sl_htf[i]
 
         # Bullish BOS Breakout
-        if not np.isnan(curr_sh) and c_1h[i] > curr_sh and curr_sh != last_sh_broken:
+        if not np.isnan(curr_sh) and c_htf[i] > curr_sh and curr_sh != last_sh_broken:
             last_sh_broken = curr_sh
             for j in range(i - 1, max(0, i - 12), -1):
-                if c_1h[j] < o_1h[j]:
+                if c_htf[j] < o_htf[j]:
                     obs.append({
                         "ob_type": "bullish",
                         "creation_time": bar_t,
-                        "ob_high": h_1h[j],
-                        "ob_low": l_1h[j],
+                        "ob_high": h_htf[j],
+                        "ob_low": l_htf[j],
                         "equal_high": curr_sh
                     })
                     break
 
         # Bearish BOS Breakdown
-        if not np.isnan(curr_sl) and c_1h[i] < curr_sl and curr_sl != last_sl_broken:
+        if not np.isnan(curr_sl) and c_htf[i] < curr_sl and curr_sl != last_sl_broken:
             last_sl_broken = curr_sl
             for j in range(i - 1, max(0, i - 12), -1):
-                if c_1h[j] > o_1h[j]:
+                if c_htf[j] > o_htf[j]:
                     obs.append({
                         "ob_type": "bearish",
                         "creation_time": bar_t,
-                        "ob_high": h_1h[j],
-                        "ob_low": l_1h[j],
+                        "ob_high": h_htf[j],
+                        "ob_low": l_htf[j],
                         "equal_low": curr_sl
                     })
                     break
@@ -509,8 +512,8 @@ def evaluate_symbol_for_sweep_setup(
     if not obs:
         return None
 
-    now_utc = closed_15m["open_time"].iloc[-1]
-    max_age = config.get("max_ob_age_hours", 24.0)
+    now_utc = closed_ltf["open_time"].iloc[-1]
+    max_age = config.get("max_ob_age_hours", 72.0)
 
     # Filter OBs within acceptable age
     active_obs = [
@@ -521,19 +524,19 @@ def evaluate_symbol_for_sweep_setup(
     if not active_obs:
         return None
 
-    # Calculate 15m ATR(14)
-    h_15 = closed_15m["high"].values
-    l_15 = closed_15m["low"].values
-    c_15 = closed_15m["close"].values
-    prev_c = np.roll(c_15, 1)
-    prev_c[0] = c_15[0]
-    tr = np.maximum(h_15 - l_15, np.maximum(np.abs(h_15 - prev_c), np.abs(l_15 - prev_c)))
+    # Calculate LTF ATR(14)
+    h_ltf = closed_ltf["high"].values
+    l_ltf = closed_ltf["low"].values
+    c_ltf = closed_ltf["close"].values
+    prev_c = np.roll(c_ltf, 1)
+    prev_c[0] = c_ltf[0]
+    tr = np.maximum(h_ltf - l_ltf, np.maximum(np.abs(h_ltf - prev_c), np.abs(l_ltf - prev_c)))
     atr14 = float(pd.Series(tr).rolling(14, min_periods=1).mean().iloc[-1])
 
-    latest_15m = closed_15m.iloc[-1]
-    last_low = float(latest_15m["low"])
-    last_high = float(latest_15m["high"])
-    last_close = float(latest_15m["close"])
+    latest_ltf = closed_ltf.iloc[-1]
+    last_low = float(latest_ltf["low"])
+    last_high = float(latest_ltf["high"])
+    last_close = float(latest_ltf["close"])
     sweep_pct = config.get("min_sweep_pct", 0.05) / 100.0
 
     # Check active OBs in reverse order (most recent first)
@@ -721,21 +724,23 @@ def run_diagnostics(client: WeexClient, config: Dict[str, Any]):
         print("  ⚠️ INFO: Telegram not configured in config. Alerts will print to terminal/log only.")
 
     # 5. Universe Scan Preview
-    print(f"\n[5/5] Scanning Top {config['top_universe_count']} Volume Universe for Live Setups...")
+    htf = config.get("htf_timeframe", "4h")
+    ltf = config.get("ltf_timeframe", "1h")
+    print(f"\n[5/5] Scanning Top {config['top_universe_count']} Volume Universe for Live {htf.upper()}/{ltf.upper()} Setups...")
     full_universe = client.get_top_contracts_by_volume(top_n=config["top_universe_count"])
     signals_found = 0
     scanned_count = 0
 
     for sym in full_universe:
-        d1h = client.get_klines(sym, granularity="1h", limit=100)
-        d15m = client.get_klines(sym, granularity="15m", limit=100)
-        if d1h is None or d15m is None:
+        d_htf = client.get_klines(sym, granularity=htf, limit=100)
+        d_ltf = client.get_klines(sym, granularity=ltf, limit=100)
+        if d_htf is None or d_ltf is None:
             continue
         scanned_count += 1
-        sig = evaluate_symbol_for_sweep_setup(d1h, d15m, sym, config)
+        sig = evaluate_symbol_for_sweep_setup(d_htf, d_ltf, sym, config)
         if sig:
             signals_found += 1
-            print(f"  ⚡ ACTIVE SWEEP FOUND: {sym} ({sig['direction'].upper()}) | Entry: ${sig['entry_price']:.4f} | SL: ${sig['sl_price']:.4f} | TP: ${sig['tp_price']:.4f}")
+            print(f"  ⚡ ACTIVE SWEEP FOUND: {sym} ({sig['direction'].upper()}) | Entry: ${sig['entry_price']:.4f} | SL: ${sig['sl_price']:.4f} | TP: ${sig['tp_price']:.4f} (R:R={sig.get('effective_rr', 0.0):.2f})")
 
     print(f"\nScan Completed: Analyzed {scanned_count} symbols. Found {signals_found} active sweep signals right now.")
     print("=" * 70 + "\n")
@@ -769,7 +774,9 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
         else:
             logger.warning("Could not resolve BTC Macro Regime; proceeding without regime gate.")
 
-    logger.info(f"Scanning {len(symbols)} Top Volume symbols for 15m Order Block Sweeps...")
+    htf = config.get("htf_timeframe", "4h")
+    ltf = config.get("ltf_timeframe", "1h")
+    logger.info(f"Scanning {len(symbols)} Top Volume symbols for {ltf.upper()} Sweeps of {htf.upper()} Order Blocks...")
     confirmed_signals = []
 
     for sym in symbols:
@@ -777,12 +784,12 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
         if sym in active_symbols:
             continue
 
-        df1h = client.get_klines(sym, granularity="1h", limit=100)
-        df15m = client.get_klines(sym, granularity="15m", limit=100)
-        if df1h is None or df15m is None:
+        df_htf = client.get_klines(sym, granularity=htf, limit=100)
+        df_ltf = client.get_klines(sym, granularity=ltf, limit=100)
+        if df_htf is None or df_ltf is None:
             continue
 
-        sig = evaluate_symbol_for_sweep_setup(df1h, df15m, sym, config)
+        sig = evaluate_symbol_for_sweep_setup(df_htf, df_ltf, sym, config)
         if sig:
             # Apply BTC Macro Regime gate
             if btc_regime["regime"] != "UNKNOWN" and sig["direction"] != btc_regime["allowed_direction"]:
@@ -845,7 +852,7 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
             order_id = result.get("orderId", "N/A")
             effective_rr = sig.get("effective_rr", config.get("risk_reward_ratio", 2.5))
             msg = (
-                f"⚡ <b>[LIVE ORDER EXECUTED] SMC ORDER BLOCK SWEEP!</b>\n"
+                f"⚡ <b>[LIVE ORDER EXECUTED] {htf.upper()}/{ltf.upper()} ORDER BLOCK SWEEP!</b>\n"
                 f"• Contract: <code>{sym}</code> ({sig['direction'].upper()})\n"
                 f"{regime_desc}"
                 f"• Entry: <code>${entry:,.4f}</code>\n"
@@ -862,7 +869,7 @@ def run_scan_and_execute(client: WeexClient, config: Dict[str, Any], symbols: Li
             active_symbols.add(sym)
             effective_rr = sig.get("effective_rr", config.get("risk_reward_ratio", 2.5))
             msg = (
-                f"🚨 <b>[DRY-RUN SIMULATION] SMC ORDER BLOCK SWEEP!</b>\n"
+                f"🚨 <b>[DRY-RUN SIMULATION] {htf.upper()}/{ltf.upper()} ORDER BLOCK SWEEP!</b>\n"
                 f"• Contract: <code>{sym}</code> ({sig['direction'].upper()})\n"
                 f"{regime_desc}"
                 f"• Entry: <code>${entry:,.4f}</code>\n"
@@ -916,14 +923,18 @@ def start_bot_daemon():
 
     # Send Startup Message
     regime_mode_desc = f"1h {config.get('btc_ema_span', 50)} EMA" if config.get("btc_regime_filter", True) else "DISABLED"
+    htf = config.get("htf_timeframe", "4h")
+    ltf = config.get("ltf_timeframe", "1h")
     startup_msg = (
         f"🤖 <b>WEEX SMC ORDER BLOCK BOT INITIALIZED</b>\n"
+        f"• Strategy: <b>{htf.upper()} Structure + {ltf.upper()} Sweeps</b>\n"
         f"• Mode: <code>{'DRY-RUN SIMULATION' if config['dry_run'] else 'LIVE EXECUTION'}</code>\n"
         f"• Universe: <b>Top {len(universe)} Volume Coins</b>\n"
         f"• BTC Macro Regime Filter: <b>{regime_mode_desc}</b>\n"
+        f"• Minimum Target Filter: <b>{config.get('min_risk_reward_ratio', 1.0):.1f}R Floor</b>\n"
         f"• Risk per Trade: <code>${config['risk_per_trade_usd']:,.0f}</code>\n"
-        f"• Native Bracket Target: <b>2.5R</b> | Stop: <b>1x ATR(14)</b>\n"
-        f"• Cadence: <b>Every 15 Minutes at Candle Close</b>"
+        f"• Native Bracket Target: <b>Up to {config.get('risk_reward_ratio', 2.5)}R</b> | Stop: <b>1x ATR(14)</b>\n"
+        f"• Cadence: <b>Hourly at Candle Close (:00 UTC)</b>"
     )
     send_telegram(config["telegram_bot_token"], config["telegram_chat_id"], startup_msg)
 
@@ -938,11 +949,12 @@ def start_bot_daemon():
             # Execute Scan Cycle
             run_scan_and_execute(client, config, universe)
 
-            # Sleep until next 15m candle close + 3 seconds buffer
+            # Sleep until next candle close + 3 seconds buffer
             now = time.time()
-            remainder = now % 900 # 900s = 15m
-            sleep_time = (900 - remainder) + 3.0
-            logger.info(f"Sleeping {sleep_time:.1f}s until next 15-minute candle close...")
+            interval = config.get("poll_interval_seconds", 3600)
+            remainder = now % interval
+            sleep_time = (interval - remainder) + 3.0
+            logger.info(f"Sleeping {sleep_time:.1f}s until next {ltf} candle close...")
             time.sleep(sleep_time)
 
         except KeyboardInterrupt:

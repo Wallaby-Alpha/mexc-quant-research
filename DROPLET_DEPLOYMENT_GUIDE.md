@@ -69,7 +69,7 @@ nano /root/mexc-quant-research/scanner_config.json
 }
 ```
 
-### 3. WEEX 15m Order Block Bot Config:
+### 3. WEEX 4h/1h Order Block Bot Config:
 ```bash
 nano /root/mexc-quant-research/weex_bot_config.json
 ```
@@ -83,14 +83,18 @@ nano /root/mexc-quant-research/weex_bot_config.json
   "risk_per_trade_usd": 100.0,
   "account_size_usd": 10000.0,
   "max_concurrent_positions": 5,
+  "htf_timeframe": "4h",
+  "ltf_timeframe": "1h",
   "risk_reward_ratio": 2.5,
   "min_risk_reward_ratio": 1.0,
   "atr_multiplier": 1.0,
+  "max_ob_age_hours": 72.0,
   "btc_regime_filter": true,
   "btc_symbol": "BTCUSDT",
   "btc_ema_span": 50,
   "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
-  "telegram_chat_id": "YOUR_TELEGRAM_CHAT_ID"
+  "telegram_chat_id": "YOUR_TELEGRAM_CHAT_ID",
+  "poll_interval_seconds": 3600
 }
 ```
 

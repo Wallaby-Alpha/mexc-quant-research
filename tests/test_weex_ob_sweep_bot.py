@@ -357,3 +357,13 @@ def test_minimum_risk_reward_filter_skips_sub_1r_trades():
     assert sig_sub_1r is None  # Skipped because 0.83R < 1.0R
 
 
+def test_4h_1h_timeframe_configuration():
+    """Validates that bot defaults to 4h HTF and 1h LTF with hourly polling."""
+    cfg = load_config()
+    assert cfg["htf_timeframe"] == "4h"
+    assert cfg["ltf_timeframe"] == "1h"
+    assert cfg["poll_interval_seconds"] == 3600
+    assert cfg["max_ob_age_hours"] >= 48.0
+
+
+
