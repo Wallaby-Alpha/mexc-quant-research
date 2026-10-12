@@ -3,7 +3,7 @@
   "secret_key": "YOUR_WEEX_SECRET_KEY",
   "passphrase": "YOUR_WEEX_PASSPHRASE",
   "dry_run": true,
-  "top_universe_count": 200,
+  "top_universe_count": 250,
   "risk_per_trade_usd": 100.0,
   "account_size_usd": 10000.0,
   "max_concurrent_positions": 5,

@@ -152,7 +152,7 @@ def test_load_config_defaults():
     """Validates fallback default config values."""
     cfg = load_config()
     assert "top_universe_count" in cfg
-    assert cfg["top_universe_count"] == 200
+    assert cfg["top_universe_count"] == 250
     assert "dry_run" in cfg
     assert "risk_per_trade_usd" in cfg
 
