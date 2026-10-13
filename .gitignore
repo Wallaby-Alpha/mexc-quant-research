@@ -38,6 +38,6 @@ scanner.log
 scratch/
 scratch_tail.txt
 
-# OS Files
-.DS_Store
-Thumbs.db
+# Standalone Bot Repositories
+weex-asymmetric-sniper-bot/
+
