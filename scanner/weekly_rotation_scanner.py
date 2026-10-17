@@ -164,6 +164,8 @@ def load_config() -> Dict[str, Any]:
         "rank_exit_buffer_raw": int(os.environ.get("BUFFER_RAW", "6")),
         "lookback_days": int(os.environ.get("LOOKBACK_DAYS", "30")),
         "min_volume_24h_usdt": float(os.environ.get("MIN_VOLUME_USDT", "500000.0")),
+        "max_3d_pump_pct": float(os.environ.get("MAX_3D_PUMP_PCT", "0.25")),  # Solution A: reject new buys with >25% in last 3d
+        "max_position_weight_pct": float(os.environ.get("MAX_POS_WEIGHT", "0.20")),  # Rebalance trim trigger at 20%
     }
     if CONFIG_FILE.exists():
         try:
@@ -322,12 +324,14 @@ def save_portfolio_state(quality_holdings: List[str], raw_holdings: List[str]):
         json.dump(data, f, indent=2)
 
 
-def run_scanner():
+def run_scanner(cfg_override: Optional[Dict[str, Any]] = None):
     logger.info("=" * 70)
     logger.info("RUNNING WEEKLY 10-COIN BARBELL ROTATIONAL MOMENTUM SCANNER")
     logger.info("=" * 70)
 
     cfg = load_config()
+    if cfg_override:
+        cfg.update(cfg_override)
     state = load_portfolio_state()
     held_quality = state.get("current_quality_holdings", [])
     held_raw = state.get("current_raw_holdings", [])
@@ -339,8 +343,12 @@ def run_scanner():
 
     now_utc = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
 
-    # If BTC is Bearish -> Cash Protection Mode
-    if not is_btc_bullish:
+    bypass_btc = cfg.get("bypass_btc_gate", False)
+    if not is_btc_bullish and bypass_btc:
+        logger.warning("Bypassing BTC Cash Gate as requested via --bypass-btc-gate.")
+
+    # If BTC is Bearish -> Cash Protection Mode (unless bypassed)
+    if not is_btc_bullish and not bypass_btc:
         msg = (
             f"🚨 <b>WEEKLY ROTATION SCANNER: CASH SHIELD TRIGGERED</b>\n"
             f"📅 <i>{now_utc}</i>\n\n"
@@ -368,54 +376,70 @@ def run_scanner():
     exchange_info = get_mexc_exchange_info()
     logger.info(f"Loaded exchangeInfo metadata for {len(exchange_info)} symbols.")
 
-    # 3. BTC is Bullish: Scan & Rank Universe
+    # 3. Scan & Rank Universe
+    lookback = cfg.get("lookback_days", 30)
+    logger.info(f"Using {lookback}-day lookback period for Relative Strength & Momentum.")
+
     symbols = get_top_mexc_pairs(min_volume=cfg["min_volume_24h_usdt"])
     if not symbols:
         logger.error("No valid pairs returned.")
         return
 
-    df_btc = get_mexc_klines("BTCUSDT", interval="1d", limit=40)
-    btc_p0 = df_btc.iloc[-31]["close"]
+    limit_bars = max(lookback + 15, 60)
+    df_btc = get_mexc_klines("BTCUSDT", interval="1d", limit=limit_bars)
+    if len(df_btc) < lookback + 1:
+        logger.error("Insufficient BTC daily bars for lookback.")
+        return
+
+    btc_p0 = df_btc.iloc[-(lookback + 1)]["close"]
     btc_p1 = df_btc.iloc[-1]["close"]
-    btc_30d_return = (btc_p1 - btc_p0) / btc_p0
-    logger.info(f"Bitcoin 30-day Return: {btc_30d_return*100:+.2f}%")
+    btc_lookback_return = (btc_p1 - btc_p0) / btc_p0
+    logger.info(f"Bitcoin {lookback}-day Return: {btc_lookback_return*100:+.2f}%")
 
     metrics_list = []
     for sym in symbols:
         if sym == "BTCUSDT":
             continue
-        df_k = get_mexc_klines(sym, interval="1d", limit=40)
-        if len(df_k) < 32:
+        df_k = get_mexc_klines(sym, interval="1d", limit=limit_bars)
+        if len(df_k) < lookback + 1:
             continue
-        p0 = df_k.iloc[-31]["close"]
+        p0 = df_k.iloc[-(lookback + 1)]["close"]
         p1 = df_k.iloc[-1]["close"]
         if p0 <= 0 or np.isnan(p0) or np.isnan(p1):
             continue
 
         alt_ret = (p1 - p0) / p0
-        rs_spread = alt_ret - btc_30d_return
+        rs_spread = alt_ret - btc_lookback_return
 
-        # Trailing 30-day annualized daily volatility
-        daily_rets = df_k["close"].pct_change().dropna()
-        vol_30d = float(daily_rets.std() * np.sqrt(365.25)) if len(daily_rets) >= 20 else 1.0
-        if np.isnan(vol_30d) or vol_30d <= 0.05:
-            vol_30d = 0.05
+        # Trailing 3-day return (acute recent pump)
+        p_3d_ago = df_k.iloc[-4]["close"] if len(df_k) >= 4 else p0
+        ret_3d = ((p1 - p_3d_ago) / p_3d_ago) if p_3d_ago > 0 else 0.0
 
-        sharpe_score = alt_ret / vol_30d
+        # Trailing annualized daily volatility over lookback
+        daily_rets = df_k["close"].pct_change().dropna().tail(lookback)
+        vol_lookback = float(daily_rets.std() * np.sqrt(365.25)) if len(daily_rets) >= max(10, int(lookback * 0.6)) else 1.0
+        if np.isnan(vol_lookback) or vol_lookback <= 0.05:
+            vol_lookback = 0.05
+
+        sharpe_score = alt_ret / vol_lookback
 
         metrics_list.append({
             "symbol": sym,
             "latest_close": p1,
-            "alt_return_30d": alt_ret,
+            "alt_return_lookback": alt_ret,
+            "ret_3d": ret_3d,
             "rs_spread_vs_btc": rs_spread,
-            "volatility_30d": vol_30d,
+            "volatility_lookback": vol_lookback,
             "sharpe_score": sharpe_score
         })
         time.sleep(0.04)
 
     df_all = pd.DataFrame(metrics_list)
+    if df_all.empty:
+        logger.error("No valid metrics computed.")
+        return
 
-    # 4. Compute Quality & Raw Rankings
+    # 4. Compute Rankings
     # A. Quality Ranking (Sharpe Score = Ret / Vol)
     df_quality = df_all.sort_values(by="sharpe_score", ascending=False).reset_index(drop=True)
     df_quality["rank_quality"] = df_quality.index + 1
@@ -424,41 +448,61 @@ def run_scanner():
     df_raw = df_all.sort_values(by="rs_spread_vs_btc", ascending=False).reset_index(drop=True)
     df_raw["rank_raw"] = df_raw.index + 1
 
+    # C. Laggard Ranking (Weakest Altcoins vs BTC for Long/Short Barbell)
+    df_laggards = df_all.sort_values(by="rs_spread_vs_btc", ascending=True).reset_index(drop=True)
+    df_laggards["rank_laggard"] = df_laggards.index + 1
+
     # Portfolio Sizing
     k_quality = cfg["top_k_quality"]  # 7
     k_raw = cfg["top_k_raw"]          # 3
     buf_quality = cfg["rank_exit_buffer_quality"]  # 11
     buf_raw = cfg["rank_exit_buffer_raw"]          # 6
+    max_3d_pump = cfg.get("max_3d_pump_pct", 0.25)  # 25% max 3d pump for new buys
 
     # 5. Construct Selections and Apply Buffer Rules
     # Quality Buffer & Target
+    # Existing holdings: evaluated strictly on rank (Buffer #11), NOT penalized by 3d pump
     quality_buffer_symbols = df_quality.head(buf_quality)["symbol"].tolist()
-    quality_top_symbols = df_quality.head(k_quality)["symbol"].tolist()
-
     holds_quality = [s for s in held_quality if s in quality_buffer_symbols]
     sells_quality = [s for s in held_quality if s not in quality_buffer_symbols]
     slots_needed_quality = k_quality - len(holds_quality)
 
+    # New Buys: apply Solution A1 (anti-exhaustion filter: reject if 3d pump > max_3d_pump)
     buys_quality = []
-    for s in quality_top_symbols:
-        if s not in holds_quality and len(buys_quality) < slots_needed_quality:
-            buys_quality.append(s)
+    skipped_quality_exhaustion = []
+    for _, row in df_quality.iterrows():
+        s = row["symbol"]
+        if s in holds_quality:
+            continue
+        if len(buys_quality) >= slots_needed_quality:
+            break
+        if row["ret_3d"] > max_3d_pump:
+            skipped_quality_exhaustion.append((s, row["ret_3d"]))
+            continue
+        buys_quality.append(s)
 
     final_quality_holdings = holds_quality + buys_quality
 
     # Raw Buffer & Target (Exclude any symbols already in Quality to prevent overlap!)
     df_raw_filtered = df_raw[~df_raw["symbol"].isin(final_quality_holdings)].reset_index(drop=True)
     raw_buffer_symbols = df_raw_filtered.head(buf_raw)["symbol"].tolist()
-    raw_top_symbols = df_raw_filtered.head(k_raw)["symbol"].tolist()
 
     holds_raw = [s for s in held_raw if s in raw_buffer_symbols and s not in final_quality_holdings]
     sells_raw = [s for s in held_raw if s not in holds_raw]
     slots_needed_raw = k_raw - len(holds_raw)
 
     buys_raw = []
-    for s in raw_top_symbols:
-        if s not in holds_raw and len(buys_raw) < slots_needed_raw:
-            buys_raw.append(s)
+    skipped_raw_exhaustion = []
+    for _, row in df_raw_filtered.iterrows():
+        s = row["symbol"]
+        if s in holds_raw:
+            continue
+        if len(buys_raw) >= slots_needed_raw:
+            break
+        if row["ret_3d"] > max_3d_pump:
+            skipped_raw_exhaustion.append((s, row["ret_3d"]))
+            continue
+        buys_raw.append(s)
 
     final_raw_holdings = holds_raw + buys_raw
     total_new_holdings = final_quality_holdings + final_raw_holdings
@@ -485,7 +529,7 @@ def run_scanner():
         f"📅 <i>{now_utc}</i>\n\n"
         f"<b>BTC Macro Trend:</b> ✅ <b>BULLISH</b> (Above 50 EMA)\n"
         f"• BTC Price: <code>${btc_close:,.2f}</code> (EMA50: <code>${btc_ema50:,.2f}</code>)\n"
-        f"• BTC 30d Return: <code>{btc_30d_return*100:+.1f}%</code>\n"
+        f"• BTC {lookback}d Return: <code>{btc_lookback_return*100:+.1f}%</code>\n"
         f"• Strategy: <b>70% Quality (Sharpe) + 30% Raw (High-Beta)</b>\n"
         f"• ⛓️ <b>Chain Exposure:</b> <i>{chain_dist_str}</i>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -510,11 +554,11 @@ def run_scanner():
         for s in buys_quality:
             row = df_quality[df_quality["symbol"] == s].iloc[0]
             ch = coin_chains.get(s, "Unknown")
-            msg += f"🟢 <b>BUY</b> <code>{s}</code> [{ch} | Quality #Q{row['rank_quality']} | Ret: {row['alt_return_30d']*100:+.1f}% | Sharpe: {row['sharpe_score']:.2f}]\n"
+            msg += f"🟢 <b>BUY</b> <code>{s}</code> [{ch} | Quality #Q{row['rank_quality']} | Ret: {row['alt_return_lookback']*100:+.1f}% | Sharpe: {row['sharpe_score']:.2f}]\n"
         for s in buys_raw:
             row = df_raw[df_raw["symbol"] == s].iloc[0]
             ch = coin_chains.get(s, "Unknown")
-            msg += f"🚀 <b>BUY</b> <code>{s}</code> [{ch} | Raw Momentum #R{row['rank_raw']} | Ret: {row['alt_return_30d']*100:+.1f}% | RS: {row['rs_spread_vs_btc']*100:+.1f}%]\n"
+            msg += f"🚀 <b>BUY</b> <code>{s}</code> [{ch} | Raw Momentum #R{row['rank_raw']} | Ret: {row['alt_return_lookback']*100:+.1f}% | RS: {row['rs_spread_vs_btc']*100:+.1f}%]\n"
         msg += "<i>💡 If a coin is unavailable or you prefer not to trade its chain, choose the next coin from the <b>Reserve Alternates</b> list below!</i>\n\n"
     else:
         msg += "✨ <i>Portfolio is at full capacity. No new buys required this week!</i>\n\n"
@@ -522,8 +566,9 @@ def run_scanner():
     # Step 3: Holds
     all_holds = holds_quality + holds_raw
     if all_holds:
-        msg += f"<b>STEP 3: HOLD SURVIVING COINS (DO NOT REBALANCE)</b>\n"
-        msg += "<i>⚠️ Do NOT trim winning coins to equalize weights. Let winners compound undisturbed over the cycle to maximize edge:</i>\n"
+        msg += f"<b>STEP 3: HOLD SURVIVING COINS</b>\n"
+        msg += "<i>• Let winners run! Do NOT trim winning coins unless a single coin grows to <b>>20% of your total portfolio</b>.</i>\n"
+        msg += "<i>• If a coin exceeds >20% NAV, trim only the excess back to 10%–12% and redistribute proceeds into open buy slots.</i>\n\n"
         for s in holds_quality:
             r = df_quality[df_quality["symbol"] == s].iloc[0]["rank_quality"]
             ch = coin_chains.get(s, "Unknown")
@@ -538,9 +583,10 @@ def run_scanner():
     msg += (
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🛡️ <b>STRATEGY EXECUTION RULES:</b>\n"
-        f"1. <b>Weekly Cadence:</b> Hold all 10 positions until next <b>Monday 00:00 UTC</b>.\n"
-        f"2. <b>No Mid-Week Panic Exits:</b> Do NOT sell on Tuesday/Wednesday dips. Backtests show 7 of 8 mid-week EMA breaks are bear-traps; exiting early slashed net profits by >50%!\n"
-        f"3. <b>Next Rebalance:</b> Next Monday 00:00 UTC.\n"
+        f"1. <b>Weekly Cadence:</b> Hold positions until next <b>Monday 00:00 UTC</b>.\n"
+        f"2. <b>Anti-Exhaustion Protection:</b> New buys strictly reject coins that surged >25% in the last 72 hours (prevents buying blow-off tops).\n"
+        f"3. <b>20% Position Cap:</b> If any single coin reaches >20% of total portfolio, harvest profits back down to 10%–12%.\n"
+        f"4. <b>No Mid-Week Panic Exits:</b> Do NOT sell on Tuesday/Wednesday dips. Wait for Sunday night 50-EMA check.\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
 
@@ -550,17 +596,17 @@ def run_scanner():
     for i, s in enumerate(final_quality_holdings, 1):
         row = df_quality[df_quality["symbol"] == s].iloc[0]
         ch = coin_chains.get(s, "Unknown")
-        msg += f" {i}. <code>{s:<10s}</code> [{ch:<10s}] +{row['alt_return_30d']*100:5.1f}% | Sharpe: {row['sharpe_score']:4.2f}\n"
+        msg += f" {i}. <code>{s:<10s}</code> [{ch:<10s}] +{row['alt_return_lookback']*100:5.1f}% | Sharpe: {row['sharpe_score']:4.2f}\n"
 
     msg += "\n<b>Speculative Raw Momentum (30%):</b>\n"
     for i, s in enumerate(final_raw_holdings, 1):
         row = df_raw[df_raw["symbol"] == s].iloc[0]
         ch = coin_chains.get(s, "Unknown")
-        msg += f" {i}. <code>{s:<10s}</code> [{ch:<10s}] +{row['alt_return_30d']*100:5.1f}% | RS: {row['rs_spread_vs_btc']*100:+5.1f}%\n"
+        msg += f" {i}. <code>{s:<10s}</code> [{ch:<10s}] +{row['alt_return_lookback']*100:5.1f}% | RS: {row['rs_spread_vs_btc']*100:+5.1f}%\n"
 
     # Part 2: Reserves and Depth Leaderboards
     msg_reserves = (
-        f"🔄 <b>RESERVE ALTERNATES & DEPTH LEADERBOARDS</b>\n"
+        f"🔄 <b>RESERVE ALTERNATES & DEPTH LEADERBOARDS ({lookback}d Lookback)</b>\n"
         f"📅 <i>{now_utc}</i>\n\n"
         f"<i>Use these replacements if you cannot or prefer not to buy any of the top picks:</i>\n\n"
         f"<b>Quality Alternates (Ranks #8 to #15):</b>\n"
@@ -568,27 +614,33 @@ def run_scanner():
     for _, row in df_quality.iloc[7:15].iterrows():
         s = row["symbol"]
         ch = resolve_chain(s, exchange_info)
-        msg_reserves += f"• <code>{s:<10s}</code> [{ch:<10s}] #Q{row['rank_quality']:2d} | +{row['alt_return_30d']*100:5.1f}% (Sharpe: {row['sharpe_score']:4.2f})\n"
+        msg_reserves += f"• <code>{s:<10s}</code> [{ch:<10s}] #Q{row['rank_quality']:2d} | +{row['alt_return_lookback']*100:5.1f}% (Sharpe: {row['sharpe_score']:4.2f})\n"
 
     msg_reserves += "\n<b>Raw Momentum Alternates (Next In Line):</b>\n"
     raw_reserves = df_raw_filtered.iloc[3:10]
     for _, row in raw_reserves.iterrows():
         s = row["symbol"]
         ch = resolve_chain(s, exchange_info)
-        msg_reserves += f"• <code>{s:<10s}</code> [{ch:<10s}] #R{row['rank_raw']:2d} | +{row['alt_return_30d']*100:5.1f}% (RS: {row['rs_spread_vs_btc']*100:+5.1f}%)\n"
+        msg_reserves += f"• <code>{s:<10s}</code> [{ch:<10s}] #R{row['rank_raw']:2d} | +{row['alt_return_lookback']*100:5.1f}% (RS: {row['rs_spread_vs_btc']*100:+5.1f}%)\n"
 
     msg_reserves += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg_reserves += "📊 <b>TOP 15 QUALITY LEADERBOARD:</b>\n"
+    msg_reserves += f"📊 <b>TOP 15 QUALITY LEADERBOARD ({lookback}d):</b>\n"
     for _, row in df_quality.head(15).iterrows():
         s = row["symbol"]
         ch = resolve_chain(s, exchange_info)
-        msg_reserves += f"<b>#Q{row['rank_quality']:2d}</b> <code>{s:<10s}</code> [{ch:<10s}]: {row['alt_return_30d']*100:+5.1f}% (Sharpe: {row['sharpe_score']:4.2f})\n"
+        msg_reserves += f"<b>#Q{row['rank_quality']:2d}</b> <code>{s:<10s}</code> [{ch:<10s}]: {row['alt_return_lookback']*100:+5.1f}% (Sharpe: {row['sharpe_score']:4.2f})\n"
 
-    msg_reserves += "\n📊 <b>TOP 15 RAW LEADERBOARD:</b>\n"
+    msg_reserves += f"\n📊 <b>TOP 15 RAW RELATIVE STRENGTH LEADERBOARD ({lookback}d):</b>\n"
     for _, row in df_raw.head(15).iterrows():
         s = row["symbol"]
         ch = resolve_chain(s, exchange_info)
-        msg_reserves += f"<b>#R{row['rank_raw']:2d}</b> <code>{s:<10s}</code> [{ch:<10s}]: {row['alt_return_30d']*100:+5.1f}% (RS: {row['rs_spread_vs_btc']*100:+5.1f}%)\n"
+        msg_reserves += f"<b>#R{row['rank_raw']:2d}</b> <code>{s:<10s}</code> [{ch:<10s}]: {row['alt_return_lookback']*100:+5.1f}% (RS: {row['rs_spread_vs_btc']*100:+5.1f}%)\n"
+
+    msg_reserves += f"\n📉 <b>BOTTOM 15 WEAKEST LAGGARDS ({lookback}d SHORT BASKET):</b>\n"
+    for _, row in df_laggards.head(15).iterrows():
+        s = row["symbol"]
+        ch = resolve_chain(s, exchange_info)
+        msg_reserves += f"<b>#S{row['rank_laggard']:2d}</b> <code>{s:<10s}</code> [{ch:<10s}]: {row['alt_return_lookback']*100:+5.1f}% (RS: {row['rs_spread_vs_btc']*100:+5.1f}%)\n"
 
     print("=" * 60)
     print(msg)
@@ -598,11 +650,34 @@ def run_scanner():
     save_portfolio_state(final_quality_holdings, final_raw_holdings)
 
     # Dispatch Part 1 (Main Action Orders) and Part 2 (Reserves/Leaderboards)
-    send_telegram_message(cfg["telegram_bot_token"], cfg["telegram_chat_id"], msg)
-    time.sleep(1.0)
-    send_telegram_message(cfg["telegram_bot_token"], cfg["telegram_chat_id"], msg_reserves)
+    if not cfg.get("no_telegram", False):
+        send_telegram_message(cfg["telegram_bot_token"], cfg["telegram_chat_id"], msg)
+        time.sleep(1.0)
+        send_telegram_message(cfg["telegram_bot_token"], cfg["telegram_chat_id"], msg_reserves)
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Weekly Relative Strength & Momentum Rotation Scanner")
+    parser.add_argument("--lookback", type=int, default=None, help="Lookback period in days (e.g. 30, 21, 14, 7)")
+    parser.add_argument("--min-volume", type=float, default=None, help="Minimum 24h volume in USDT (e.g. 500000)")
+    parser.add_argument("--bypass-btc-gate", action="store_true", help="Show rankings even if BTC is below 50-day EMA")
+    parser.add_argument("--no-telegram", action="store_true", help="Print to console only without sending Telegram alerts")
+    args = parser.parse_args()
+
+    cfg = load_config()
+    if args.lookback is not None:
+        cfg["lookback_days"] = args.lookback
+    if args.min_volume is not None:
+        cfg["min_volume_24h_usdt"] = args.min_volume
+    if args.bypass_btc_gate:
+        cfg["bypass_btc_gate"] = True
+    if args.no_telegram:
+        cfg["no_telegram"] = True
+
+    run_scanner(cfg_override=cfg)
 
 
 if __name__ == "__main__":
-    run_scanner()
+    main()
 
