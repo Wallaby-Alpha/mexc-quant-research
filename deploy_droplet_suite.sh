@@ -65,15 +65,23 @@ if [ ! -f "${APP_DIR}/weex_bot_config.json" ]; then
     echo "  -> Created weex_bot_config.json"
 fi
 
+if [ ! -f "${APP_DIR}/weex_scanner_config.json" ]; then
+    cp ${APP_DIR}/scanner/deploy/weex_scanner_config.example.json ${APP_DIR}/weex_scanner_config.json
+    echo "  -> Created weex_scanner_config.json"
+fi
+
 # 5. Setup Cron Jobs for Scheduled Scanners
 echo ">>> [5/6] Registering Cron Schedules..."
 # Kraken Scanner: Daily at 00:01 UTC
 CRON_KRAKEN="1 0 * * * cd ${APP_DIR} && ${APP_DIR}/venv/bin/python ${APP_DIR}/scanner/kraken_market_neutral_scanner.py >> ${APP_DIR}/market_neutral_scanner.log 2>&1"
 # Barbell Scanner: Mondays at 00:02 UTC
 CRON_BARBELL="2 0 * * 1 cd ${APP_DIR} && ${APP_DIR}/venv/bin/python ${APP_DIR}/scanner/weekly_rotation_scanner.py >> ${APP_DIR}/scanner.log 2>&1"
+# WEEX Specialized Setup Scanner: Every 4 Hours (at :05 past the hour)
+CRON_WEEX_SCANNER="5 */4 * * * cd ${APP_DIR} && ${APP_DIR}/venv/bin/python ${APP_DIR}/scanner/weex_specialized_setup_scanner.py >> ${APP_DIR}/weex_specialized_scanner.log 2>&1"
 
 # Add cron jobs without duplicates
-(crontab -l 2>/dev/null | grep -Fv "kraken_market_neutral_scanner.py" | grep -Fv "weekly_rotation_scanner.py" ; echo "$CRON_KRAKEN" ; echo "$CRON_BARBELL") | crontab -
+(crontab -l 2>/dev/null | grep -Fv "kraken_market_neutral_scanner.py" | grep -Fv "weekly_rotation_scanner.py" | grep -Fv "weex_specialized_setup_scanner.py" ; echo "$CRON_KRAKEN" ; echo "$CRON_BARBELL" ; echo "$CRON_WEEX_SCANNER") | crontab -
+
 
 # 6. Setup Systemd Service for WEEX 24/7 Daemon
 echo ">>> [6/6] Configuring Systemd Service for WEEX Order Block Bot..."

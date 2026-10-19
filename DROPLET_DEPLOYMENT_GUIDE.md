@@ -4,9 +4,11 @@ This guide walks through setting up a fresh DigitalOcean droplet to run all 3 qu
 
 | System | Cadence / Engine | Telegram Alert Sample |
 | :--- | :--- | :--- |
-| **1. Kraken Dynamic Regime & RS Scanner** (`scanner/kraken_market_neutral_scanner.py`) | Daily at 00:01 UTC (via Cron) | `⚖️ KRAKEN DYNAMIC REGIME & RS SCANNER` |
-| **2. 10-Coin Barbell Momentum Scanner** (`scanner/weekly_rotation_scanner.py`) | Weekly Mondays 00:02 UTC (via Cron) | `🎯 10-COIN BARBELL MOMENTUM SCANNER` |
-| **3. WEEX SMC Order Block Liquidity Sweep Bot** (`bot/weex_ob_sweep_bot.py`) | 24/7 Continuous Daemon (every 15m candle close via Systemd) | `🚨/⚡ SMC ORDER BLOCK SWEEP` |
+| **1. WEEX Specialized Setup Scanner** (`scanner/weex_specialized_setup_scanner.py`) | Every 4 Hours (via Cron) | `🚨 WEEX SPECIALIZED SETUP ALERTS` |
+| **2. Kraken Dynamic Regime & RS Scanner** (`scanner/kraken_market_neutral_scanner.py`) | Daily at 00:01 UTC (via Cron) | `⚖️ KRAKEN DYNAMIC REGIME & RS SCANNER` |
+| **3. 10-Coin Barbell Momentum Scanner** (`scanner/weekly_rotation_scanner.py`) | Weekly Mondays 00:02 UTC (via Cron) | `🎯 10-COIN BARBELL MOMENTUM SCANNER` |
+| **4. WEEX SMC Order Block Liquidity Sweep Bot** (`bot/weex_ob_sweep_bot.py`) | 24/7 Continuous Daemon (every 15m candle close via Systemd) | `🚨/⚡ SMC ORDER BLOCK SWEEP` |
+
 
 ---
 
