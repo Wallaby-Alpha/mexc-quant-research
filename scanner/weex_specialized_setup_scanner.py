@@ -387,25 +387,37 @@ def run_scan() -> Dict[str, Any]:
                 ref = df_c['open'].iloc[-7] if len(df_c) >= 7 else c
                 dist = ((c - ref) / ref) * 100
                 lvl_str = f"WO: {ref:.4f}"
+                dist_str = f"{dist:+.2f}%"
             elif strat == 'Donchian_Breakout':
                 ref = df_c['high'].iloc[-21:-1].max()
                 dist = ((ref - c) / c) * 100
                 lvl_str = f"20D High: {ref:.4f}"
+                dist_str = f"{dist:+.2f}%"
             elif strat == 'BB_Mean_Reversion':
                 sma20 = df_c['close'].iloc[-21:-1].mean()
                 std20 = df_c['close'].iloc[-21:-1].std()
                 ref = sma20 - 2.0 * std20
                 dist = ((c - ref) / c) * 100
                 lvl_str = f"Lower BB: {ref:.4f}"
+                dist_str = f"{dist:+.2f}%"
             elif strat == 'Turtle_Soup':
                 ref = df_c['low'].iloc[-21:-1].min()
                 dist = ((c - ref) / c) * 100
                 lvl_str = f"20D Low: {ref:.4f}"
+                dist_str = f"{dist:+.2f}%"
+            elif strat == 'Volume_Absorption':
+                curr = df_c.iloc[-1]
+                tot_rng = max(curr['high'] - curr['low'], 1e-8)
+                lw = min(curr['open'], curr['close']) - curr['low']
+                wick_pct = (lw / tot_rng) * 100
+                vol_avg = df_c['volume'].iloc[-21:-1].mean()
+                vol_mult = curr['volume'] / vol_avg if vol_avg > 0 else 0
+                lvl_str = f"Wick:{wick_pct:.0f}%/55%"
+                dist_str = f"Vol:{vol_mult:.1f}x/1.8x"
             else:
-                ref = df_c['low'].iloc[-1]
-                dist = 0.0
-                lvl_str = f"Low Wick: {ref:.4f}"
-            print(f"{m['coin']:<10} {c:<12.4f} {strat:<24} {lvl_str:<18} {dist:+.2f}%")
+                lvl_str = f"{c:.4f}"
+                dist_str = "N/A"
+            print(f"{m['coin']:<10} {c:<12.4f} {strat:<24} {lvl_str:<18} {dist_str}")
 
     print("\n" + "=" * 90)
     
