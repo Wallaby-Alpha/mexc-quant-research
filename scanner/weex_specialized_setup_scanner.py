@@ -64,6 +64,7 @@ def load_scanner_config() -> Dict[str, Any]:
 
 def send_telegram_alert(text: str, token: str, chat_id: str) -> bool:
     if not token or not chat_id:
+        logger.warning(f"Telegram not configured: token={'SET' if token else 'EMPTY'}, chat_id={'SET' if chat_id else 'EMPTY'}")
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
@@ -74,10 +75,16 @@ def send_telegram_alert(text: str, token: str, chat_id: str) -> bool:
     }
     try:
         r = requests.post(url, json=payload, timeout=10)
-        return r.status_code == 200
+        if r.status_code == 200:
+            logger.info("Successfully sent Telegram alert.")
+            return True
+        else:
+            logger.error(f"Telegram API error HTTP {r.status_code}: {r.text}")
+            return False
     except Exception as e:
-        logger.error(f"Telegram notification failed: {e}")
+        logger.error(f"Telegram request failed: {e}")
         return False
+
 
 
 # Coin-to-strategy specialized mapping
