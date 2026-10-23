@@ -63,20 +63,47 @@ CONFIG_CANDIDATES = [
 STATE_FILE = Path("weex_london_dip_positions.json")
 
 
+def load_dotenv():
+    """Natively parses .env file without requiring external dependencies."""
+    candidates = [
+        Path(".env"),
+        Path(__file__).resolve().parent / ".env",
+        Path(__file__).resolve().parent.parent / ".env"
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip("'\"")
+                            if k:
+                                os.environ[k] = v
+                logger.info(f"Loaded environment variables from {p}")
+                break
+            except Exception as e:
+                logger.warning(f"Could not read {p}: {e}")
+
+
 def load_config() -> Dict[str, Any]:
     """Loads configuration with fallback candidates and environment variable overrides."""
+    load_dotenv()
+    
     cfg = {
         "api_key": os.environ.get("WEEX_API_KEY", ""),
         "secret_key": os.environ.get("WEEX_SECRET_KEY", ""),
         "passphrase": os.environ.get("WEEX_PASSPHRASE", ""),
-        "dry_run": True,
-        "max_risk_usd": 1.0,
-        "min_prior_day_gain_pct": 10.0,
-        "max_candidates": 5,
-        "stop_loss_pct": 8.0,
-        "entry_time_utc": "08:00",
-        "scan_time_utc": "07:55",
-        "exit_time_utc": "20:00",
+        "dry_run": os.environ.get("WEEX_DRY_RUN", "true").lower() in ("true", "1", "yes"),
+        "max_risk_usd": float(os.environ.get("MAX_RISK_USD", 1.0)),
+        "min_prior_day_gain_pct": float(os.environ.get("MIN_PRIOR_DAY_GAIN_PCT", 10.0)),
+        "max_candidates": int(os.environ.get("MAX_CANDIDATES", 5)),
+        "stop_loss_pct": float(os.environ.get("STOP_LOSS_PCT", 8.0)),
+        "entry_time_utc": os.environ.get("ENTRY_TIME_UTC", "08:00"),
+        "scan_time_utc": os.environ.get("SCAN_TIME_UTC", "07:55"),
+        "exit_time_utc": os.environ.get("EXIT_TIME_UTC", "20:00"),
         "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
         "send_heartbeat_daily": True
@@ -92,6 +119,20 @@ def load_config() -> Dict[str, Any]:
                     break
             except Exception as e:
                 logger.warning(f"Could not load config from {path}: {e}")
+
+    # Re-apply non-empty environment overrides
+    if os.environ.get("WEEX_API_KEY"):
+        cfg["api_key"] = os.environ["WEEX_API_KEY"]
+    if os.environ.get("WEEX_SECRET_KEY"):
+        cfg["secret_key"] = os.environ["WEEX_SECRET_KEY"]
+    if os.environ.get("WEEX_PASSPHRASE"):
+        cfg["passphrase"] = os.environ["WEEX_PASSPHRASE"]
+    if os.environ.get("TELEGRAM_BOT_TOKEN"):
+        cfg["telegram_bot_token"] = os.environ["TELEGRAM_BOT_TOKEN"]
+    if os.environ.get("TELEGRAM_CHAT_ID"):
+        cfg["telegram_chat_id"] = os.environ["TELEGRAM_CHAT_ID"]
+    if "WEEX_DRY_RUN" in os.environ:
+        cfg["dry_run"] = os.environ["WEEX_DRY_RUN"].lower() in ("true", "1", "yes")
 
     return cfg
 
