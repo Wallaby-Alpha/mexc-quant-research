@@ -4,6 +4,8 @@
   "passphrase": "YOUR_WEEX_PASSPHRASE",
   "dry_run": true,
   "max_risk_usd": 1.0,
+  "max_leverage": 10,
+  "margin_type": "CROSSED",
   "min_prior_day_gain_pct": 10.0,
   "max_candidates": 5,
   "stop_loss_pct": 8.0,

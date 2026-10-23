@@ -98,6 +98,8 @@ def load_config() -> Dict[str, Any]:
         "passphrase": os.environ.get("WEEX_PASSPHRASE", ""),
         "dry_run": os.environ.get("WEEX_DRY_RUN", "true").lower() in ("true", "1", "yes"),
         "max_risk_usd": float(os.environ.get("MAX_RISK_USD", 1.0)),
+        "max_leverage": int(os.environ.get("MAX_LEVERAGE", 10)),
+        "margin_type": os.environ.get("MARGIN_TYPE", "CROSSED"),
         "min_prior_day_gain_pct": float(os.environ.get("MIN_PRIOR_DAY_GAIN_PCT", 10.0)),
         "max_candidates": int(os.environ.get("MAX_CANDIDATES", 5)),
         "stop_loss_pct": float(os.environ.get("STOP_LOSS_PCT", 8.0)),
@@ -133,6 +135,10 @@ def load_config() -> Dict[str, Any]:
         cfg["telegram_chat_id"] = os.environ["TELEGRAM_CHAT_ID"]
     if "WEEX_DRY_RUN" in os.environ:
         cfg["dry_run"] = os.environ["WEEX_DRY_RUN"].lower() in ("true", "1", "yes")
+    if "MAX_LEVERAGE" in os.environ:
+        cfg["max_leverage"] = int(os.environ["MAX_LEVERAGE"])
+    if "MARGIN_TYPE" in os.environ:
+        cfg["margin_type"] = os.environ["MARGIN_TYPE"]
 
     return cfg
 
@@ -261,15 +267,33 @@ class WeexClient:
         symbol: str,
         entry_price: float,
         sl_pct: float = 0.08,
-        max_risk_usd: float = 1.0
+        max_risk_usd: float = 1.0,
+        max_leverage: int = 10
     ) -> Tuple[float, float, bool, str]:
         """
         Calculates position size strictly risking max_risk_usd ($1.00).
         If the minimum contract size requires more than max_risk_usd, REJECTS trade.
+        Also validates that max_leverage is capped at <= 10x so liquidation distance
+        strictly exceeds the stop loss distance (preventing premature liquidation at -5%).
 
         Returns:
             (actual_quantity, actual_risk_usd, is_eligible, reason)
         """
+        # Hard cap leverage at 10x
+        effective_leverage = min(int(max_leverage), 10) if max_leverage > 0 else 10
+
+        # Liquidation safety check:
+        # At L leverage, liquidation distance is approx ~1/L (e.g. 5% at 20x, 10% at 10x).
+        # If stop loss >= liquidation distance, the position liquidates before SL can trigger!
+        liq_distance = 1.0 / effective_leverage
+        if sl_pct >= liq_distance:
+            return (
+                0.0,
+                0.0,
+                False,
+                f"Stop loss ({sl_pct*100:.1f}%) exceeds liquidation distance ({liq_distance*100:.1f}%) at {effective_leverage}x leverage"
+            )
+
         info = self.exchange_info.get(symbol, {
             "pricePrecision": 4,
             "quantityPrecision": 2,
@@ -316,6 +340,54 @@ class WeexClient:
             actual_risk_usd = actual_qty * entry_price * sl_pct
 
         return actual_qty, actual_risk_usd, True, "Eligible"
+
+    def set_leverage(self, symbol: str, leverage: int = 10, margin_type: str = "CROSSED") -> Dict[str, Any]:
+        """
+        Sets contract leverage and margin type on WEEX.
+        Strictly enforces leverage <= 10x so liquidation distance exceeds the 8% stop loss.
+        """
+        # Enforce hard 10x leverage ceiling
+        safe_leverage = min(int(leverage), 10) if leverage > 0 else 10
+        margin_type = margin_type.upper() if margin_type else "CROSSED"
+
+        if self.dry_run:
+            logger.info(f"[DRY RUN] SET LEVERAGE for {symbol}: {safe_leverage}x ({margin_type})")
+            return {
+                "status": "simulated",
+                "symbol": symbol,
+                "leverage": safe_leverage,
+                "marginType": margin_type
+            }
+
+        path = "/capi/v3/account/leverage"
+        payload = {
+            "symbol": symbol,
+            "marginType": margin_type,
+            "leverage": str(safe_leverage),
+            "crossLeverage": str(safe_leverage),
+            "isolatedLeverage": str(safe_leverage)
+        }
+        body_str = json.dumps(payload)
+        headers = self._get_headers("POST", path, body=body_str)
+
+        try:
+            r = requests.post(f"{self.base_url}{path}", headers=headers, data=body_str, timeout=10)
+            res = r.json()
+            if r.status_code == 200 and res.get("code") == "00000":
+                logger.info(f"✅ Set leverage for {symbol} to {safe_leverage}x ({margin_type})")
+                return {
+                    "status": "success",
+                    "symbol": symbol,
+                    "leverage": safe_leverage,
+                    "marginType": margin_type,
+                    "data": res.get("data")
+                }
+            else:
+                logger.warning(f"⚠️ Could not set leverage for {symbol}: {res}")
+                return {"status": "error", "error": res}
+        except Exception as e:
+            logger.error(f"Exception setting leverage for {symbol}: {e}")
+            return {"status": "error", "error": str(e)}
 
     def format_values(self, symbol: str, qty: float, entry_p: float, sl_p: float) -> Tuple[str, str, str]:
         """Formats order numbers to symbol precision rules."""
@@ -502,6 +574,7 @@ class LondonDipBot:
         max_cands = self.cfg.get("max_candidates", 5)
         max_risk = self.cfg.get("max_risk_usd", 1.0)
         sl_pct = self.cfg.get("stop_loss_pct", 8.0) / 100.0
+        max_lev = min(int(self.cfg.get("max_leverage", 10)), 10)
 
         logger.info("🌅 Running 07:55 UTC Pre-London Momentum Scan...")
         tickers = self.client.get_ticker_24hr()
@@ -531,7 +604,8 @@ class LondonDipBot:
                         symbol=sym,
                         entry_price=curr_price,
                         sl_pct=sl_pct,
-                        max_risk_usd=max_risk
+                        max_risk_usd=max_risk,
+                        max_leverage=max_lev
                     )
                     qualified.append({
                         "symbol": sym,
@@ -573,7 +647,7 @@ class LondonDipBot:
                 lines.append(
                     f"✅ <b>{s['symbol']}</b>: +{gain_pct:.1f}% yesterday\n"
                     f"   • Price: ${price:.4f} | Size: {s['qty']} lots (${notional:.2f} notional)\n"
-                    f"   • Dollar Risk: <b>${s['risk_usd']:.2f}</b> (<= ${max_risk:.2f})\n"
+                    f"   • Dollar Risk: <b>${s['risk_usd']:.2f}</b> (<= ${max_risk:.2f}) | Max Lev: <b>{max_lev}x</b>\n"
                 )
             else:
                 lines.append(
@@ -588,6 +662,8 @@ class LondonDipBot:
     def execute_morning_entries(self, candidates: List[Dict[str, Any]]):
         """Executes Market Buy orders on all eligible candidates at 08:00 UTC."""
         sl_pct = self.cfg.get("stop_loss_pct", 8.0) / 100.0
+        max_lev = min(int(self.cfg.get("max_leverage", 10)), 10)
+        m_type = self.cfg.get("margin_type", "CROSSED")
         mode_str = "🧪 DRY RUN" if self.cfg.get("dry_run", True) else "⚡ LIVE"
         executed = []
 
@@ -599,6 +675,9 @@ class LondonDipBot:
             curr_p = self.client.get_current_price(sym) or cand["current_price"]
             sl_price = curr_p * (1.0 - sl_pct)
             qty = cand["qty"]
+
+            # Strictly enforce leverage cap (<= 10x) and margin mode on WEEX before entry
+            self.client.set_leverage(symbol=sym, leverage=max_lev, margin_type=m_type)
 
             res = self.client.place_market_buy_with_sl(
                 symbol=sym,
@@ -615,6 +694,8 @@ class LondonDipBot:
                     "qty": qty,
                     "sl_price": sl_price,
                     "risk_usd": cand["risk_usd"],
+                    "leverage": max_lev,
+                    "margin_type": m_type,
                     "orderId": res.get("orderId", "")
                 }
                 executed.append(cand)
@@ -625,7 +706,7 @@ class LondonDipBot:
             lines = [
                 f"🚀 <b>LONDON OPEN EXECUTION [{mode_str}]</b>",
                 f"<i>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</i>\n",
-                f"Entered <b>{len(executed)}</b> position(s) with native -{sl_pct*100:.1f}% stop loss:\n"
+                f"Entered <b>{len(executed)}</b> position(s) with max <b>{max_lev}x ({m_type})</b> leverage:\n"
             ]
             for e in executed:
                 p = e["current_price"]
@@ -634,6 +715,7 @@ class LondonDipBot:
                 lines.append(
                     f"🔹 <b>{e['symbol']}</b>: Bought {e['qty']} @ ${p:.4f}\n"
                     f"   • Notional: ${notional:.2f} | Risk: <b>${e['risk_usd']:.2f}</b>\n"
+                    f"   • Leverage: <b>{max_lev}x ({m_type})</b> (Liq distance ~{100.0/max_lev:.0f}% > {sl_pct*100:.1f}% SL)\n"
                     f"   • Native Stop Loss: ${sl:.4f} (-{sl_pct*100:.1f}%)\n"
                 )
             lines.append("Positions will be held until <b>20:00 UTC</b> (NY Cash Close).")
@@ -685,7 +767,14 @@ class LondonDipBot:
     def run_daemon(self):
         """Main 24/7 background loop."""
         mode_str = "DRY RUN (Paper Trading)" if self.cfg.get("dry_run", True) else "LIVE CAPITAL"
-        self.notify(f"🤖 <b>WEEX SETUP 11 BOT STARTED</b>\nMode: <b>{mode_str}</b>\nMax Risk: <b>${self.cfg.get('max_risk_usd', 1.0):.2f}/trade</b>")
+        max_lev = min(int(self.cfg.get("max_leverage", 10)), 10)
+        m_type = self.cfg.get("margin_type", "CROSSED")
+        self.notify(
+            f"🤖 <b>WEEX SETUP 11 BOT STARTED</b>\n"
+            f"Mode: <b>{mode_str}</b>\n"
+            f"Max Risk: <b>${self.cfg.get('max_risk_usd', 1.0):.2f}/trade</b>\n"
+            f"Max Leverage: <b>{max_lev}x ({m_type})</b>"
+        )
 
         last_scan_day = None
         last_entry_day = None

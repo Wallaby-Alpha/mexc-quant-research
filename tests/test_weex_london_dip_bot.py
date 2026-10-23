@@ -140,3 +140,93 @@ def test_dry_run_market_buy_and_close():
     res_close = client.close_position_market("PEPEUSDT", 100000.0)
     assert res_close["status"] == "simulated"
     assert res_close["qty"] == 100000.0
+
+
+def test_set_leverage_dry_run_and_cap():
+    """Verifies that leverage is strictly capped at <= 10x even if higher leverage is requested."""
+    client = WeexClient("key", "sec", "pass", dry_run=True)
+    
+    # Requesting 20x must be clamped to 10x
+    res = client.set_leverage("ETHUSDT", leverage=20, margin_type="CROSSED")
+    assert res["status"] == "simulated"
+    assert res["leverage"] == 10
+    assert res["marginType"] == "CROSSED"
+
+    # Requesting 5x should remain 5x
+    res5 = client.set_leverage("ETHUSDT", leverage=5, margin_type="ISOLATED")
+    assert res5["status"] == "simulated"
+    assert res5["leverage"] == 5
+    assert res5["marginType"] == "ISOLATED"
+
+
+def test_liquidation_distance_rejection():
+    """
+    Verifies that trades are rejected if the stop loss distance meets or exceeds
+    the liquidation distance at the given leverage.
+    """
+    client = WeexClient("key", "sec", "pass", dry_run=True)
+    client.exchange_info = {
+        "DOGEUSDT": {
+            "pricePrecision": 5,
+            "quantityPrecision": 0,
+            "contractVal": 10.0,
+            "minOrderSize": 10.0
+        }
+    }
+
+    # At 10x leverage, liquidation occurs at ~10% (0.10).
+    # If SL is 12% (0.12), position would liquidate at -10% before SL executes at -12%.
+    # MUST BE REJECTED!
+    qty, risk, eligible, reason = client.calculate_risk_position_size(
+        symbol="DOGEUSDT",
+        entry_price=0.15,
+        sl_pct=0.12,
+        max_risk_usd=1.00,
+        max_leverage=10
+    )
+    assert eligible is False
+    assert qty == 0.0
+    assert "exceeds liquidation distance" in reason
+
+    # At 10x leverage with 8% SL (0.08), liquidation is ~10% > 8% SL -> ELIGIBLE
+    qty_ok, risk_ok, eligible_ok, reason_ok = client.calculate_risk_position_size(
+        symbol="DOGEUSDT",
+        entry_price=0.15,
+        sl_pct=0.08,
+        max_risk_usd=1.00,
+        max_leverage=10
+    )
+    assert eligible_ok is True
+    assert qty_ok > 0
+    assert reason_ok == "Eligible"
+
+
+def test_set_leverage_api_live(monkeypatch):
+    """Verifies live API payload construction for set_leverage."""
+    import json
+
+    client = WeexClient("key", "sec", "pass", dry_run=False)
+    client.base_url = "https://mock.weex.com"
+
+    recorded = {}
+
+    def mock_post(url, headers, data, timeout):
+        recorded["url"] = url
+        recorded["headers"] = headers
+        recorded["payload"] = json.loads(data)
+        
+        class MockResponse:
+            status_code = 200
+            def json(self):
+                return {"code": "00000", "msg": "success", "data": {"leverage": "10"}}
+        return MockResponse()
+
+    import requests
+    monkeypatch.setattr(requests, "post", mock_post)
+
+    res = client.set_leverage("BTCUSDT", leverage=50, margin_type="CROSSED")
+    assert res["status"] == "success"
+    assert recorded["payload"]["leverage"] == "10"  # Strictly clamped
+    assert recorded["payload"]["marginType"] == "CROSSED"
+    assert recorded["url"] == "https://mock.weex.com/capi/v3/account/leverage"
+
